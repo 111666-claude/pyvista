@@ -1844,6 +1844,18 @@ class SmartVolumeMapper(_BaseVolumeMapper, _vtk.vtkSmartVolumeMapper):
         self.AutoAdjustSampleDistancesOff()
         self.InteractiveAdjustSampleDistancesOff()
 
+    @_BaseVolumeMapper.blend_mode.setter
+    def blend_mode(self, value: str | int) -> None:
+        """Set the blend mode and select a color-preserving render path."""
+        _BaseVolumeMapper.blend_mode.fset(self, value)
+        if self.blend_mode == 'additive':
+            # VTK's GPU modes skip the color transfer function for additive
+            # blending and render grayscale/white. Ray casting honors it and
+            # matches FixedPointVolumeRayCastMapper (pyvista/pyvista#7703).
+            self.SetRequestedRenderModeToRayCast()
+        else:
+            self.SetRequestedRenderModeToDefault()
+
 
 class UnstructuredGridVolumeRayCastMapper(
     _BaseVolumeMapper, _vtk.vtkUnstructuredGridVolumeRayCastMapper
