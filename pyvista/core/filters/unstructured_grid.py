@@ -6,8 +6,10 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+import pyvista as pv
 from pyvista import _vtk
 from pyvista.core.filters import _get_output
+from pyvista.core.filters import _match_points_dtype
 from pyvista.core.filters import _update_alg
 from pyvista.core.filters.data_set import DataSetFilters
 from pyvista.core.filters.poly_data import PolyDataFilters
@@ -18,6 +20,106 @@ if TYPE_CHECKING:
     from pyvista import UnstructuredGrid
     from pyvista.core._typing_core._dataset_types import _UnstructuredGridType
     from pyvista.core.pointset import PolyData
+
+# Edges of a tetrahedron, as pairs of its local vertex indices. The order fixes the
+# layout of the six edge midpoints used by :data:`_TETRA_CHILDREN`.
+_TETRA_EDGES = ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))
+
+# The twelve child tetrahedra. Local ids 0-3 are the corners, 4-9 are the edge
+# midpoints in ``_TETRA_EDGES`` order, and 10 is the centroid. The four corner
+# tetrahedra come first, followed by the eight that fill the central octahedron.
+_TETRA_CHILDREN = np.array(
+    [
+        [0, 4, 5, 6],
+        [1, 4, 7, 8],
+        [2, 5, 7, 9],
+        [3, 6, 8, 9],
+        [10, 4, 5, 6],
+        [10, 4, 7, 8],
+        [10, 5, 7, 9],
+        [10, 6, 8, 9],
+        [10, 4, 7, 5],
+        [10, 4, 8, 6],
+        [10, 7, 9, 8],
+        [10, 5, 9, 6],
+    ],
+    dtype=np.intp,
+)
+
+
+def _subdivide_tetra(mesh: UnstructuredGrid) -> UnstructuredGrid:
+    """Subdivide tetrahedral ``mesh`` into twelve oriented tetrahedra each."""
+    tetra = mesh.cell_connectivity.reshape(-1, 4).astype(np.intp, copy=False)
+    n_tetra = tetra.shape[0]
+
+    points = np.asarray(mesh.points, dtype=np.float64)
+    n_points = points.shape[0]
+
+    # Weld midpoints by the canonical pair of endpoint ids so tetrahedra that share
+    # an edge reuse one midpoint and the shared face is refined identically.
+    edge_pairs = np.asarray(_TETRA_EDGES, dtype=np.intp)
+    edges = np.sort(tetra[:, edge_pairs].reshape(-1, 2), axis=1)
+    unique_edges, edge_inverse = np.unique(edges, axis=0, return_inverse=True)
+    n_edges = unique_edges.shape[0]
+    edge_midpoints = n_points + edge_inverse.reshape(n_tetra, len(_TETRA_EDGES))
+    centroids = n_points + n_edges + np.arange(n_tetra, dtype=np.intp)
+
+    new_points = np.empty((n_points + n_edges + n_tetra, 3), dtype=np.float64)
+    new_points[:n_points] = points
+    new_points[n_points : n_points + n_edges] = 0.5 * (
+        points[unique_edges[:, 0]] + points[unique_edges[:, 1]]
+    )
+    new_points[n_points + n_edges :] = points[tetra].mean(axis=1)
+
+    local_ids = np.concatenate((tetra, edge_midpoints, centroids[:, None]), axis=1)
+    child_cells = local_ids[:, _TETRA_CHILDREN].reshape(-1, 4)
+
+    # A swapped pair puts a child in the same positive-determinant orientation for
+    # either ordering of the input vertices.
+    p0, p1, p2, p3 = (new_points[child_cells[:, i]] for i in range(4))
+    determinant = np.linalg.det(np.stack((p1 - p0, p2 - p0, p3 - p0), axis=1))
+    inverted = determinant < 0.0
+    child_cells[inverted] = child_cells[inverted][:, [0, 1, 3, 2]]
+
+    cells = np.empty((n_tetra * len(_TETRA_CHILDREN), 5), dtype=np.intp)
+    cells[:, 0] = 4
+    cells[:, 1:] = child_cells
+
+    output = pv.UnstructuredGrid(
+        cells.ravel(),
+        np.full(n_tetra * len(_TETRA_CHILDREN), _vtk.VTK_TETRA, dtype=np.uint8),
+        new_points,
+    )
+
+    n_new_points = new_points.shape[0]
+    for name in mesh.point_data:
+        source = mesh.point_data[name]
+        if source.dtype.kind in 'iufb':
+            values = np.empty((n_new_points, *source.shape[1:]), dtype=np.float64)
+            values[:n_points] = source
+            left = source[unique_edges[:, 0]].astype(np.float64)
+            right = source[unique_edges[:, 1]].astype(np.float64)
+            values[n_points : n_points + n_edges] = 0.5 * (left + right)
+            vertex_values = source[tetra].astype(np.float64)
+            values[n_points + n_edges :] = vertex_values.mean(axis=1)
+        else:
+            # Non-numeric arrays have no meaningful interpolation; preserve every
+            # original value and carry an endpoint/vertex value onto new points.
+            values = np.empty((n_new_points, *source.shape[1:]), dtype=source.dtype)
+            values[:n_points] = source
+            values[n_points : n_points + n_edges] = source[unique_edges[:, 0]]
+            values[n_points + n_edges :] = source[tetra[:, 0]]
+        output.point_data[name] = values
+
+    for name in mesh.cell_data:
+        # Each input tetrahedron owns the twelve child cells that follow it.
+        output.cell_data[name] = np.repeat(mesh.cell_data[name], 12, axis=0)
+
+    _match_points_dtype(output, mesh)
+    if mesh.field_data.keys():
+        output.field_data.update(mesh.field_data)
+    output.copy_meta_from(mesh, deep=True)
+    return output
 
 
 @abstract_class
@@ -36,6 +138,11 @@ class UnstructuredGridFilters(DataSetFilters):
 
     def subdivide_tetra(self) -> UnstructuredGrid:
         """Subdivide each tetrahedron into twelve tetrahedrons.
+
+        Edge midpoints are shared between neighboring tetrahedra, so the refined
+        mesh has no cracks, and every resulting tetrahedron is positively oriented.
+        Point data is linearly interpolated at the new midpoints and centroids, and
+        cell data is copied from each tetrahedron to its twelve children.
 
         Returns
         -------
@@ -56,6 +163,9 @@ class UnstructuredGridFilters(DataSetFilters):
         >>> subdivided.plot(show_edges=True, line_width=2)
 
         """
+        if self.n_cells and np.all(self.celltypes == _vtk.VTK_TETRA):
+            return _subdivide_tetra(self)
+
         alg = _vtk.vtkSubdivideTetra()
         alg.SetInputData(self)
         _update_alg(alg)
