@@ -3589,6 +3589,15 @@ class DataSet(_BoundsSizeMixin, DataSetFilters, DataObject):
         return bool(np.any(self.cell_data[name] == _vtk.vtkDataSetAttributes.HIDDENCELL))
 
     @property
+    def _has_hidden_two_dimensional_structured_cells(self) -> bool:
+        """Return True for a 2D structured grid with hidden cells."""
+        return (
+            isinstance(self, pv.StructuredGrid)
+            and self._has_hidden_cells
+            and sum(dimension > 1 for dimension in self.dimensions) == 2
+        )
+
+    @property
     def _distinct_cell_dimensions(self) -> set[_Dimensionality]:
         """Compute distinct dimensions of cells. Only needed for legacy vtk < 9.5."""
         if self.n_cells == 0:

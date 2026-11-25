@@ -6219,7 +6219,12 @@ class DataSetFilters(DataObjectFilters):
         message: str = 'Extracting Surface',
     ) -> PolyData:
         surf_filter = _vtk.vtkDataSetSurfaceFilter()
-        surf_filter.SetInputData(self)
+        dataset: DataSet = self
+        if self._has_hidden_two_dimensional_structured_cells:
+            # vtkDataSetSurfaceFilter ignores HIDDENCELL flags on 2D
+            # vtkStructuredGrid instances; the unstructured-grid path honors them.
+            dataset = self.cast_to_unstructured_grid()
+        surf_filter.SetInputData(dataset)
         surf_filter.SetPassThroughPointIds(pass_pointid)
         surf_filter.SetPassThroughCellIds(pass_cellid)
         surf_filter.SetNonlinearSubdivisionLevel(nonlinear_subdivision)

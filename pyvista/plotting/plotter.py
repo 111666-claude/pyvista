@@ -4368,6 +4368,13 @@ class BasePlotter(_BoundsSizeMixin):
 
         """
         if (
+            isinstance(mesh, pv.StructuredGrid)
+            and mesh._has_hidden_two_dimensional_structured_cells
+        ):
+            # VTK's structured-grid mapper does not hide 2D ghost cells on all versions.
+            mesh = mesh.cast_to_unstructured_grid()
+
+        if (
             pv.vtk_version_info == (9, 6, 0)
             and isinstance(mesh, pv.UnstructuredGrid)
             and (ghost_name := _vtk.vtkDataSetAttributes.GhostArrayName()) in mesh.cell_data.keys()
