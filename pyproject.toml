@@ -678,6 +678,7 @@ pyvista = "pv"
   'FBT002',
   'PLR0917',
 ]
+'pyvista/plotting/_svg.py' = ['S314'] # validates local GL2PS output
 'pyvista/plotting/_typing.py' = ['PLC0414']
 'pyvista/plotting/actor_properties.py' = ['ANN']
 'pyvista/plotting/camera.py' = ['S314'] # .pvcc is trusted
@@ -702,6 +703,7 @@ pyvista = "pv"
   'PTH118',
   'PTH119',
 ]
+'tests/plotting/test_svg_multiline_text.py' = ['S314'] # trusted SVG
 # Sphinx-Gallery examples are rendered verbatim, like those under 'examples/'
 'tests/plotting/tinypages/gallery_src/*' = ['I002']
 'tests/security/test_pickle_refused.py' = ['S301'] # unpickles its own objects

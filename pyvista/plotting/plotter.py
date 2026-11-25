@@ -64,6 +64,7 @@ from ._plotting import _remap_scalars_through_topology_change
 from ._plotting import _stamp_raw_numpy_scalars
 from ._plotting import process_opacity
 from ._property import Property
+from ._svg import split_multiline_text
 from .actor import Actor
 from .camera import Camera
 from .colors import Color
@@ -7382,6 +7383,21 @@ class BasePlotter(_BoundsSizeMixin):
         if painter:
             writer.UsePainterSettings()
         writer.Update()
+
+        if extension == '.svg':
+            # GL2PS leaves explicit newlines inside a single <text> node, where
+            # SVG collapses them to whitespace; split them into positioned
+            # <tspan> lines so multiline titles and text export correctly.
+            svg_path = filepath.with_suffix('.svg')
+            try:
+                svg_text = svg_path.read_text(encoding='utf-8')
+                svg_path.write_text(
+                    split_multiline_text(svg_text),
+                    encoding='utf-8',
+                )
+            except OSError:
+                # The GL2PS file is already written; keep it as exported.
+                pass
 
     # fmt: off
     # ruff: disable[E501, FBT001]
