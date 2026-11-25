@@ -2580,7 +2580,12 @@ class PolyDataFilters(DataSetFilters):
         normal.SetComputeCellNormals(cell_normals)
         normal.SetComputePointNormals(point_normals)
         normal.SetSplitting(split_vertices)
-        normal.SetFlipNormals(flip_normals)
+        # vtk >= 9.4 moved cell reversal into an orientation stage that only
+        # runs with consistency or auto-orient enabled, and its point normals
+        # ignore the flip in that stage. Apply the flip ourselves so the cell
+        # ordering and the point and cell normals always agree.
+        manually_flip = flip_normals and pv.vtk_version_info >= (9, 4, 0)
+        normal.SetFlipNormals(flip_normals and not manually_flip)
         normal.SetConsistency(consistent_normals)
         normal.SetAutoOrientNormals(auto_orient_normals)
         normal.SetNonManifoldTraversal(non_manifold_traversal)
@@ -2594,6 +2599,10 @@ class PolyDataFilters(DataSetFilters):
         _update_alg(normal, progress_bar=progress_bar, message='Computing Normals')
 
         mesh = _get_output(normal)
+        if manually_flip:
+            # reversing in place would also mutate the caller's shared cell arrays
+            mesh = mesh.copy(deep=True)
+            _flip_polygon_faces_and_normals(mesh)
         attributes = (mesh.point_data, mesh.cell_data)
         if any(
             compute and data.active_normals_name != 'Normals'
@@ -5569,3 +5578,19 @@ def _with_64_bit_faces(mesh: PolyData) -> PolyData:
     converted = mesh.copy(deep=False)
     converted.SetPolys(faces)
     return converted
+
+
+def _flip_polygon_faces_and_normals(mesh: PolyData) -> None:
+    """Reverse the point order of polygon cells and negate active normals in place.
+
+    Only polygon cells are reversed; vertex and line cells keep their ordering.
+    """
+    polys = mesh.GetPolys()
+    connectivity = _vtk.vtk_to_numpy(polys.GetConnectivityArray())
+    offsets = _vtk.vtk_to_numpy(polys.GetOffsetsArray())
+    for start, end in itertools.pairwise(offsets):
+        connectivity[start:end] = connectivity[start:end][::-1]
+    for attributes in (mesh.point_data, mesh.cell_data):
+        name = attributes.active_normals_name
+        if name is not None:
+            attributes[name] *= -1

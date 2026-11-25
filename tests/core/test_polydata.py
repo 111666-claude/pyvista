@@ -1406,6 +1406,222 @@ def test_compute_normals_split_vertices(cube):
     assert len(set(cube_split_norm.point_data['pyvistaOriginalPointIds'])) == 8
 
 
+def _winding_normal(mesh, cell_id):
+    # normal implied geometrically by the order of a triangular cell's points
+    points = np.asarray(mesh.get_cell(cell_id).points)
+    normal = np.cross(points[1] - points[0], points[2] - points[0])
+    return normal / np.linalg.norm(normal)
+
+
+@pytest.mark.parametrize('consistent_normals', [True, False])
+@pytest.mark.parametrize('auto_orient_normals', [True, False])
+def test_compute_normals_flip_reverses_faces_and_normals(
+    sphere, consistent_normals, auto_orient_normals
+):
+    original_faces = [list(sphere.get_cell(i).point_ids) for i in range(sphere.n_cells)]
+    unflipped = sphere.compute_normals()
+
+    flipped = sphere.compute_normals(
+        flip_normals=True,
+        consistent_normals=consistent_normals,
+        auto_orient_normals=auto_orient_normals,
+    )
+
+    # every face has its point order reversed, so the winding flips with it
+    assert all(
+        list(flipped.get_cell(i).point_ids) == list(reversed(original_faces[i]))
+        for i in range(sphere.n_cells)
+    )
+    # cell and point normals are the negation of the unflipped normals
+    assert np.allclose(flipped.cell_data['Normals'], -unflipped.cell_data['Normals'], atol=1e-5)
+    assert np.allclose(flipped.point_data['Normals'], -unflipped.point_data['Normals'], atol=1e-5)
+    # geometric winding agrees with the computed cell normal on every face
+    for i in range(sphere.n_cells):
+        assert np.dot(_winding_normal(flipped, i), flipped.cell_data['Normals'][i]) > 0.999
+    # the input mesh is not modified when inplace is left at its default
+    assert all(
+        list(sphere.get_cell(i).point_ids) == original_faces[i] for i in range(sphere.n_cells)
+    )
+
+
+@pytest.mark.parametrize('consistent_normals', [True, False])
+@pytest.mark.parametrize('auto_orient_normals', [True, False])
+def test_compute_normals_flip_open_surface(consistent_normals, auto_orient_normals):
+    plane = pv.Plane(i_resolution=3, j_resolution=3)
+    original_faces = [list(plane.get_cell(i).point_ids) for i in range(plane.n_cells)]
+    unflipped = plane.compute_normals()
+
+    flipped = plane.compute_normals(
+        flip_normals=True,
+        consistent_normals=consistent_normals,
+        auto_orient_normals=auto_orient_normals,
+    )
+    assert all(
+        list(flipped.get_cell(i).point_ids) == list(reversed(original_faces[i]))
+        for i in range(plane.n_cells)
+    )
+    assert np.allclose(flipped.cell_data['Normals'], -unflipped.cell_data['Normals'], atol=1e-5)
+    assert np.allclose(flipped.point_data['Normals'], -unflipped.point_data['Normals'], atol=1e-5)
+    assert all(
+        list(plane.get_cell(i).point_ids) == original_faces[i] for i in range(plane.n_cells)
+    )
+
+
+@pytest.mark.parametrize('consistent_normals', [True, False])
+@pytest.mark.parametrize('auto_orient_normals', [True, False])
+def test_compute_normals_flip_cube(consistent_normals, auto_orient_normals):
+    # one face is wound backwards so the orientation options have work to do
+    cube = pv.Cube()
+    faces = cube.faces.copy().reshape(-1, 5)  # quad rows: [4, a, b, c, d]
+    faces[0, [1, 4]] = faces[0, [4, 1]]
+    cube.faces = faces.ravel()
+    original_faces = [list(cube.get_cell(i).point_ids) for i in range(cube.n_cells)]
+    unflipped = cube.compute_normals(
+        consistent_normals=consistent_normals, auto_orient_normals=auto_orient_normals
+    )
+
+    flipped = cube.compute_normals(
+        flip_normals=True,
+        consistent_normals=consistent_normals,
+        auto_orient_normals=auto_orient_normals,
+    )
+    assert np.allclose(flipped.cell_data['Normals'], -unflipped.cell_data['Normals'], atol=1e-5)
+    assert np.allclose(flipped.point_data['Normals'], -unflipped.point_data['Normals'], atol=1e-5)
+    for cell_id in range(cube.n_cells):
+        cell_normal = flipped.cell_data['Normals'][cell_id]
+        if np.linalg.norm(cell_normal) < 1e-8:
+            continue  # the deliberately mis-wound face has an undefined cell normal
+        cell = flipped.get_cell(cell_id)
+        points = np.asarray(cell.points)
+        winding = np.cross(points[1] - points[0], points[2] - points[0])
+        winding /= np.linalg.norm(winding)
+        assert np.dot(winding, cell_normal) > 0.999
+    # the input mesh is never modified by the default non-inplace call
+    assert all(list(cube.get_cell(i).point_ids) == original_faces[i] for i in range(cube.n_cells))
+
+
+def test_compute_normals_flip_keeps_line_cell_ordering(sphere):
+    lines = pv.MultipleLines()
+    mixed = pv.merge([sphere, lines], merge_points=False)
+    line_id = next(i for i in range(mixed.n_cells) if mixed.get_cell(i).type == pv.CellType.LINE)
+    line_ids = list(mixed.get_cell(line_id).point_ids)
+    face_id = next(
+        i for i in range(mixed.n_cells) if mixed.get_cell(i).type == pv.CellType.TRIANGLE
+    )
+    face_ids = list(mixed.get_cell(face_id).point_ids)
+
+    flipped = mixed.compute_normals(
+        flip_normals=True, consistent_normals=False, auto_orient_normals=False
+    )
+    # lines have no orientation to flip; polygons do
+    assert list(flipped.get_cell(line_id).point_ids) == line_ids
+    assert list(flipped.get_cell(face_id).point_ids) == list(reversed(face_ids))
+
+
+def test_compute_normals_flip_triangle_strip():
+    points = np.array(
+        [[0, 0, 0], [1, 0, 0], [0.5, 1, 0], [1.5, 1, 0], [1, 2, 0], [2, 2, 0]],
+        dtype=float,
+    )
+    strip = pv.PolyData(points, strips=np.array([6, 0, 1, 2, 3, 4, 5]))
+    unflipped = strip.compute_normals()
+
+    flipped = strip.compute_normals(
+        flip_normals=True, consistent_normals=False, auto_orient_normals=False
+    )
+    # strips are still triangulated, and the resulting normals are flipped
+    assert all(flipped.get_cell(i).type == pv.CellType.TRIANGLE for i in range(flipped.n_cells))
+    assert np.allclose(flipped.cell_data['Normals'], -unflipped.cell_data['Normals'], atol=1e-5)
+    assert np.allclose(flipped.point_data['Normals'], -unflipped.point_data['Normals'], atol=1e-5)
+
+
+def test_compute_normals_flip_mixed_polygon_sizes_32bit_storage():
+    # one mesh with a triangle, a quad and a polygon, forced onto 32-bit cell
+    # storage so the connectivity reversal covers both cell-array layouts
+    points = np.array(
+        [
+            [0, 0, 0],
+            [1, 0, 0],
+            [1, 1, 0],
+            [0, 1, 0],
+            [2, 0, 0],
+            [3, 0, 0],
+            [3, 1, 0],
+            [2, 1, 0],
+            [4, 0, 0],
+            [5, 0, 0],
+            [5.3, 0.9, 0],
+            [4.7, 1.6, 0],
+            [4, 1, 0],
+        ],
+        dtype=float,
+    )
+    mesh = pv.PolyData(
+        points,
+        faces=np.concatenate(
+            [
+                [3, 0, 1, 2],  # triangle
+                [4, 4, 5, 6, 7],  # quad
+                [5, 8, 9, 10, 11, 12],  # pentagon
+            ]
+        ),
+    )
+    mesh.GetPolys().ConvertTo32BitStorage()
+    assert not mesh.GetPolys().IsStorage64Bit()
+    original_faces = [list(mesh.get_cell(i).point_ids) for i in range(mesh.n_cells)]
+    unflipped = mesh.compute_normals()
+
+    flipped = mesh.compute_normals(
+        flip_normals=True, consistent_normals=False, auto_orient_normals=False
+    )
+    assert not flipped.GetPolys().IsStorage64Bit()
+    assert all(
+        list(flipped.get_cell(i).point_ids) == list(reversed(original_faces[i]))
+        for i in range(mesh.n_cells)
+    )
+    assert np.allclose(flipped.cell_data['Normals'], -unflipped.cell_data['Normals'], atol=1e-5)
+    assert np.allclose(flipped.point_data['Normals'], -unflipped.point_data['Normals'], atol=1e-5)
+    # the 32-bit input mesh and its cell sizes are left untouched
+    assert not mesh.GetPolys().IsStorage64Bit()
+    assert all(list(mesh.get_cell(i).point_ids) == original_faces[i] for i in range(mesh.n_cells))
+
+
+def test_compute_normals_flip_split_vertices(cube):
+    unflipped = cube.compute_normals(split_vertices=True)
+    flipped = cube.compute_normals(
+        flip_normals=True,
+        split_vertices=True,
+        consistent_normals=False,
+        auto_orient_normals=False,
+    )
+    assert flipped.n_points == unflipped.n_points
+    assert 'pyvistaOriginalPointIds' in flipped.point_data
+    assert all(
+        list(flipped.get_cell(i).point_ids)
+        == list(reversed(list(unflipped.get_cell(i).point_ids)))
+        for i in range(flipped.n_cells)
+    )
+    assert np.allclose(flipped.cell_data['Normals'], -unflipped.cell_data['Normals'], atol=1e-5)
+    assert np.allclose(flipped.point_data['Normals'], -unflipped.point_data['Normals'], atol=1e-5)
+
+
+@pytest.mark.parametrize('inplace', [True, False])
+def test_compute_normals_flip_inplace(sphere, inplace):
+    original_faces = [list(sphere.get_cell(i).point_ids) for i in range(sphere.n_cells)]
+    result = sphere.compute_normals(
+        flip_normals=True,
+        consistent_normals=False,
+        auto_orient_normals=False,
+        inplace=inplace,
+    )
+    assert (result is sphere) == inplace
+    expected = sphere if inplace else result
+    assert all(
+        list(expected.get_cell(i).point_ids) == list(reversed(original_faces[i]))
+        for i in range(expected.n_cells)
+    )
+
+
 @pytest.fixture
 def ant_with_normals(ant):
     ant['Scalars'] = range(ant.n_points)
