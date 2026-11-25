@@ -571,6 +571,10 @@ class BasePlotter(_BoundsSizeMixin):
         )
 
         self.image_transparent_background = self._theme.transparent_background
+        # Background mode shared by the frames of the movie currently open. It is
+        # fixed when a movie/gif is opened so a later screenshot cannot recompose the
+        # stream. ``None`` only for a writer attached without open_gif/open_movie.
+        self._frame_transparent_background: _TransparentBackgroundOptions | None = None
 
         # optional function to be called prior to closing
         self.__before_close_callback: weakref.ref[Callable[[Plotter], None]] | None = None
@@ -5999,6 +6003,7 @@ class BasePlotter(_BoundsSizeMixin):
             with contextlib.suppress(BaseException):
                 self.mwriter.close()
             self.mwriter = None
+        self._frame_transparent_background = None
 
         # Remove the global reference to this plotter unless building the
         # gallery to allow it to collect.
@@ -6335,6 +6340,7 @@ class BasePlotter(_BoundsSizeMixin):
             isinstance(pv.FIGURE_PATH, str) and not Path(filename).is_absolute()
         ):  # pragma: no cover
             filename = Path(pv.FIGURE_PATH) / filename
+        self._frame_transparent_background = self.image_transparent_background
         self.mwriter = get_writer(filename, fps=framerate, quality=quality, **kwargs)
 
     def open_gif(
@@ -6419,7 +6425,14 @@ class BasePlotter(_BoundsSizeMixin):
         else:  # pragma: no cover
             kwargs['fps'] = fps
 
+        self._frame_transparent_background = self.image_transparent_background
         self.mwriter = get_writer(filename, **kwargs)
+        # The v3 Pillow writer forwards write_args to Pillow; restore the background
+        # before each frame so transparent frames do not retain the previous one. The
+        # legacy imageio GIF writer already uses disposal 2 with subrectangles=False.
+        write_args = getattr(self.mwriter, 'write_args', None)
+        if isinstance(write_args, dict):
+            write_args.setdefault('disposal', 2)
 
     def write_frame(
         self, *, transparent_background: _TransparentBackgroundOptions | None = None
@@ -6431,8 +6444,11 @@ class BasePlotter(_BoundsSizeMixin):
         transparent_background : bool | 'straight' | 'premultiplied', optional
             Whether the frame has a transparent background, with the same options as
             :meth:`screenshot`. ``'straight'`` and ``'premultiplied'`` render the scene
-            again over a black background. Defaults to the plotter's transparent
-            background, which is set by the theme and by :meth:`screenshot`.
+            again over a black background. When ``None``, this defaults to the
+            plotter's transparent background captured by :meth:`open_gif` or
+            :meth:`open_movie`, and every frame of that movie shares the value so its
+            compositing stays consistent. An intervening :meth:`screenshot` does not
+            change it; pass the value explicitly to override a single frame.
 
             .. versionadded:: 0.50
 
@@ -6452,7 +6468,9 @@ class BasePlotter(_BoundsSizeMixin):
             self.render()
 
         if transparent_background is None:
-            transparent_background = self.image_transparent_background
+            if self._frame_transparent_background is None:
+                self._frame_transparent_background = self.image_transparent_background
+            transparent_background = self._frame_transparent_background
         _validate_transparent_background(transparent_background)
         mwriter = self._get_mwriter_not_none()
         self.update()
