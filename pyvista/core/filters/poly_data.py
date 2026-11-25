@@ -3074,17 +3074,29 @@ class PolyDataFilters(DataSetFilters):
         color = pv.Color(color, default_color=pv.global_theme.edge_color)
 
         if faces:
-            centers = self.cell_centers().points[::use_every]
-            normals = self.cell_normals
+            if self.cell_data.active_normals is not None:
+                centers = self.cell_centers().points
+                normals = self.cell_normals
+            else:
+                # ``vtkPolyDataNormals`` breaks triangle strips down into
+                # triangles, so compute the centers from the same output to
+                # keep every normal paired with the center it belongs to.
+                normals_mesh = self.compute_normals(
+                    cell_normals=True,
+                    point_normals=False,
+                    inplace=False,
+                )
+                centers = normals_mesh.cell_centers().points
+                normals = normals_mesh.cell_data['Normals']
         else:
-            centers = self.points[::use_every]
+            centers = self.points
             normals = self.point_normals
 
         if flip:
-            normals *= -1
+            normals = -normals
 
         pl.add_arrows(
-            centers,
+            centers[::use_every],
             normals[::use_every],
             mag=mag,
             color=color,
