@@ -1872,6 +1872,65 @@ class UnstructuredGridVolumeRayCastMapper(
         self.AutoAdjustSampleDistancesOff()
 
 
+class ProjectedTetrahedraVolumeMapper(_BaseVolumeMapper, _vtk.vtkOpenGLProjectedTetrahedraMapper):
+    """Wrap :vtk:`vtkOpenGLProjectedTetrahedraMapper`.
+
+    Renders an unstructured grid of tetrahedra by projecting them onto the
+    screen. Only the ``'composite'`` and ``'maximum'`` blend modes are
+    supported by the underlying VTK mapper.
+
+    Parameters
+    ----------
+    theme : pyvista.plotting.themes.Theme, optional
+        Plot-specific theme.
+
+    """
+
+    _SUPPORTED_BLEND_MODES = ('composite', 'maximum')
+    _SUPPORTED_BLEND_MODE_IDS = frozenset(
+        {_vtk.vtkVolumeMapper.COMPOSITE_BLEND, _vtk.vtkVolumeMapper.MAXIMUM_INTENSITY_BLEND}
+    )
+
+    def __init__(self, theme: Theme | None = None) -> None:
+        """Initialize this class."""
+        super().__init__(theme=theme)
+
+    @property
+    def blend_mode(self) -> _BlendModeOptions:  # numpydoc ignore=RT01
+        """Return or set the blend mode.
+
+        Only ``'composite'`` and ``'maximum'`` are supported.
+
+        """
+        return super().blend_mode
+
+    @blend_mode.setter
+    def blend_mode(self, value: str | int) -> None:
+        if isinstance(value, int):
+            if value not in self._SUPPORTED_BLEND_MODE_IDS:
+                supported = ', '.join(f'"{item}"' for item in self._SUPPORTED_BLEND_MODES)
+                msg = (
+                    f'Blend mode {value} is not supported by the projected-tetrahedra '
+                    f'volume mapper. Choose either {supported}.'
+                )
+                raise ValueError(msg)
+            self.SetBlendMode(value)
+            return
+        _validation.check_instance(value, str, name='blend_mode')
+        mode = value.lower()
+        if mode in ['composite', 'comp']:
+            self.SetBlendModeToComposite()
+        elif mode in ['maximum', 'max', 'maximum_intensity']:
+            self.SetBlendModeToMaximumIntensity()
+        else:
+            supported = ', '.join(f'"{item}"' for item in self._SUPPORTED_BLEND_MODES)
+            msg = (
+                f'Blend mode {value!r} is not supported by the projected-tetrahedra '
+                f'volume mapper. Choose either {supported}.'
+            )
+            raise ValueError(msg)
+
+
 def _mapper_has_data_set_input(mapper: Any) -> bool:
     """Check if mapper has a data set input using the appropriate method.
 

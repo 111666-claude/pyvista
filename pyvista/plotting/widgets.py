@@ -31,6 +31,7 @@ from pyvista.core.utilities.misc import try_callback
 from .affine_widget import AffineWidget3D
 from .colors import Color
 from .colors import _validate_color_sequence
+from .mapper import ProjectedTetrahedraVolumeMapper
 from .opts import PickerType
 from .utilities.algorithms import add_ids_algorithm
 from .utilities.algorithms import algorithm_to_mesh_handler
@@ -38,6 +39,7 @@ from .utilities.algorithms import crinkle_algorithm
 from .utilities.algorithms import outline_algorithm
 from .utilities.algorithms import pointset_to_polydata_algorithm
 from .utilities.algorithms import set_algorithm_input
+from .volume import Volume
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -63,7 +65,6 @@ if TYPE_CHECKING:
     from .actor import Actor
     from .plotter import BasePlotter
     from .text import Text
-    from .volume import Volume
 
     _PlaneWidget: TypeAlias = _vtk.vtkImplicitPlaneWidget | _vtk.vtkPlaneWidget
 
@@ -119,6 +120,43 @@ def _parse_interaction_event(
         raise ValueError(msg)
 
     return event_map[interaction_event]
+
+
+def _box_is_collapsed(planes: _vtk.vtkPlanes, *, tolerance: float = 1e-9) -> bool:
+    """Return whether a box widget's plane collection has any zero-thickness slab.
+
+    A face dragged onto its opposite face either produces a plane with a zero
+    normal or two coincident planes. Opposing planes are grouped by their
+    normalized normal so the check stays valid when the box is rotated. Each
+    call to ``GetPlane`` must be given a fresh sink because the method reuses a
+    single internal plane object.
+
+    """
+    groups: list[list[tuple[NDArray[np.floating[Any]], NDArray[np.floating[Any]]]]] = []
+    for i in range(planes.GetNumberOfPlanes()):
+        plane = _vtk.vtkPlane()
+        planes.GetPlane(i, plane)
+        normal = np.asarray(plane.GetNormal(), dtype=float)
+        norm = float(np.linalg.norm(normal))
+        if norm <= tolerance:
+            return True
+        unit = normal / norm
+        origin = np.asarray(plane.GetOrigin(), dtype=float)
+        for group in groups:
+            reference = group[0][0]
+            if abs(abs(float(np.dot(unit, reference))) - 1.0) <= 1e-6:
+                group.append((unit, origin))
+                break
+        else:
+            groups.append([(unit, origin)])
+
+    for group in groups:
+        if len(group) != 2:
+            return True
+        (unit0, origin0), (_, origin1) = group
+        if abs(float(np.dot(origin1 - origin0, unit0))) <= tolerance:
+            return True
+    return False
 
 
 class WidgetComponent(_NoNewAttrMixin):
@@ -1103,6 +1141,204 @@ class WidgetComponent(_NoNewAttrMixin):
         )
         widget.GetPlane(plane)
         volume_actor.mapper.AddClippingPlane(plane)
+
+        return widget
+
+    def add_volume_clip_box(
+        self,
+        /,
+        volume: Volume | ImageData,
+        *,
+        invert: bool = False,
+        rotation_enabled: bool = False,
+        widget_color: ColorLike | None = None,
+        outline_translation: bool = True,
+        interaction_event: InteractionEventType = 'end',
+        factor: float = 1.25,
+        **kwargs: Any,
+    ) -> _vtk.vtkBoxWidget:
+        """Clip a volume using a box widget.
+
+        Add a volume to the scene with a box widget whose six faces can be
+        dragged independently to clip the volume interactively. The visible
+        voxels update on every interaction.
+
+        The input :class:`~pyvista.ImageData` is never modified. Clipping runs
+        through a :vtk:`vtkClipVolume` pipeline whose
+        :class:`~pyvista.UnstructuredGrid` output is rendered by a
+        :vtk:`vtkOpenGLProjectedTetrahedraMapper`. The clipped volume shares
+        the original volume's property, including the color and opacity
+        transfer functions and shading, and the camera is left unchanged. The
+        projected-tetrahedra mapper supports only the ``'composite'`` and
+        ``'maximum'`` blend modes; other ``blending`` values raise a
+        :class:`ValueError`.
+
+        A collapsed box (a face moved onto its opposite face) shows no voxels
+        when clipping inside and the full volume when clipping outside. A box
+        placed entirely outside the volume shows the full volume when clipping
+        inside and nothing when clipping outside.
+
+        .. versionadded:: 0.50.0
+
+        Parameters
+        ----------
+        volume : pyvista.plotting.volume.Volume or pyvista.ImageData
+            New dataset of type :class:`pyvista.ImageData`, or the
+            :class:`~pyvista.plotting.volume.Volume` returned by
+            :func:`pyvista.Plotter.add_volume`. The grid must be
+            three-dimensional with at least two cells along each axis.
+
+        invert : bool, default: False
+            When ``False`` (the default), the voxels inside the box are shown.
+            When ``True``, the voxels outside the box are shown instead.
+
+        rotation_enabled : bool, default: False
+            If ``False``, the box widget cannot be rotated and is strictly
+            orthogonal to the Cartesian axes.
+
+        widget_color : ColorLike, optional
+            Color of the widget. Either a string, RGB sequence, or hex color
+            string. For example:
+
+            * ``color='white'``
+            * ``color='w'``
+            * ``color=[1.0, 1.0, 1.0]``
+            * ``color='#FFFFFF'``
+
+        outline_translation : bool, optional
+            If ``False``, the box widget cannot be translated and is strictly
+            placed at the volume bounds.
+
+        interaction_event : InteractionEventType, optional
+            The VTK interaction event to use for triggering the callback.
+            Accepts either the strings ``'start'``, ``'end'``, ``'always'`` or
+            a :vtk:`vtkCommand.EventIds`.
+
+        factor : float, optional
+            An inflation factor to expand on the bounds when placing.
+
+        **kwargs : dict, optional
+            All additional keyword arguments are passed to
+            :func:`pyvista.Plotter.add_volume` to control how the volume is
+            displayed. Only applicable if ``volume`` is an
+            :class:`pyvista.ImageData`.
+
+        Returns
+        -------
+        :vtk:`vtkBoxWidget`
+            Box widget.
+
+        Examples
+        --------
+        Shows an interactive box used to clip a volume.
+
+        >>> import pyvista as pv
+        >>> vol = pv.Wavelet()
+        >>> pl = pv.Plotter()
+        >>> _ = pl.add_volume_clip_box(vol)
+        >>> pl.show()
+
+        """
+        if isinstance(volume, pv.ImageData):
+            if volume.n_cells == 0:
+                msg = 'The `volume` ImageData must have at least one cell.'
+                raise ValueError(msg)
+            image_data = volume
+            actor_name = kwargs.get('name')
+            volume_actor = self._plotter.add_volume(volume, **kwargs)
+        elif isinstance(volume, pv.plotting.volume.Volume):
+            assert_empty_kwargs(**kwargs)
+            volume_actor = volume
+            actor_name = None
+            input_data = volume_actor.mapper.GetInput()
+            if not isinstance(input_data, pv.ImageData):
+                msg = (
+                    'The `volume` must render a pyvista.ImageData. Box clipping '
+                    f'receives a {type(input_data).__name__} from the volume mapper.'
+                )
+                raise TypeError(msg)
+            image_data = input_data
+        else:
+            msg = (  # type: ignore[unreachable]
+                'The `volume` parameter type must be either pyvista.ImageData '
+                'or a pyvista.plotting.volume.Volume from `Plotter.add_volume`.'
+            )
+            raise TypeError(msg)
+
+        if any(dim < 3 for dim in image_data.dimensions):
+            msg = (
+                'Box clipping requires a three-dimensional ImageData with at least '
+                f'two cells per axis. Got dimensions {image_data.dimensions}.'
+            )
+            raise ValueError(msg)
+
+        clipper = _vtk.vtkClipVolume()
+        clipper.SetInputDataObject(image_data)
+        # vtkClipVolume keeps the positive side of the implicit function. The
+        # box planes point inward, so showing the box interior requires InsideOut.
+        clipper.SetInsideOut(not invert)
+
+        # One persistent mapper and actor: only the input dataset changes on an
+        # interaction. The projected-tetrahedra mapper renders the tetrahedral
+        # unstructured grid the clipper produces and shares the original
+        # mapper's lookup table, scalar range, and blend mode.
+        original_mapper = volume_actor.mapper
+        clipped_mapper = ProjectedTetrahedraVolumeMapper(theme=self._plotter._theme)
+        clipped_mapper.lookup_table = original_mapper.lookup_table
+        clipped_mapper.scalar_map_mode = original_mapper.scalar_map_mode
+        clipped_mapper.scalar_range = original_mapper.scalar_range
+        clipped_mapper.blend_mode = original_mapper.blend_mode
+
+        clipped_actor = Volume()
+        clipped_actor.mapper = clipped_mapper
+        clipped_actor.prop = volume_actor.prop
+
+        def _set_dataset(dataset: pv.UnstructuredGrid | None) -> None:
+            if dataset is None:
+                clipped_mapper.dataset = pv.UnstructuredGrid()
+                clipped_actor.visibility = False
+            else:
+                clipped_mapper.dataset = dataset
+                clipped_mapper.update()
+                clipped_actor.visibility = True
+
+        def callback(planes: _vtk.vtkPlanes) -> None:
+            if _box_is_collapsed(planes):
+                # Outside an empty region is the whole volume.
+                _set_dataset(
+                    image_data.cast_to_unstructured_grid().triangulate() if invert else None
+                )
+            else:
+                clipper.SetClipFunction(planes)
+                _update_alg(clipper)
+                clipped = _get_output(clipper, output_type=pv.UnstructuredGrid)
+                _set_dataset(clipped.triangulate() if clipped.n_cells else None)
+
+        self._plotter.add_actor(clipped_actor, name=actor_name, reset_camera=False, render=False)
+
+        # Re-point any scalar bar the original volume created at the clipped
+        # mapper before removing the original actor, whose removal would
+        # otherwise tear the bar down. Swap only the original mapper so a bar
+        # shared with another volume keeps its other mappers.
+        scalar_bar_mappers = self._plotter.scalar_bars._scalar_bar_mappers
+        for title, mappers in scalar_bar_mappers.items():
+            if original_mapper in mappers:
+                scalar_bar_mappers[title] = [
+                    clipped_mapper if mapper is original_mapper else mapper for mapper in mappers
+                ]
+
+        # The box widget's initial callback sets the clipped dataset.
+        widget = self.add_box_widget(
+            callback=callback,
+            bounds=image_data.bounds,
+            factor=factor,
+            rotation_enabled=rotation_enabled,
+            use_planes=True,
+            color=widget_color,
+            outline_translation=outline_translation,
+            interaction_event=interaction_event,
+        )
+        self._plotter.remove_actor(volume_actor, render=False)
 
         return widget
 

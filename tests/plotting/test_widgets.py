@@ -813,6 +813,304 @@ def test_add_volume_clip_plane(uniform):
     pl.close()
 
 
+def _gradient_volume():
+    """Build a small ImageData whose scalars encode the point coordinates."""
+    grid = pv.ImageData(dimensions=(8, 8, 8), spacing=(1, 1, 1))
+    grid['scalars'] = (grid.x + 10 * grid.y + 100 * grid.z).astype(np.float32)
+    return grid
+
+
+def _box_planes(pl, bounds, *, rotation_z=None):
+    """Build the plane collection a box widget produces for the given bounds."""
+    box_widget = _vtk.vtkBoxWidget()
+    box_widget.SetInteractor(pl.iren.interactor)
+    box_widget.SetCurrentRenderer(pl.renderer)
+    box_widget.SetPlaceFactor(1.0)
+    box_widget.PlaceWidget(bounds)
+    box_widget.On()
+    if rotation_z is not None:
+        transform = _vtk.vtkTransform()
+        transform.PostMultiply()
+        center = [(bounds[2 * i] + bounds[2 * i + 1]) / 2 for i in range(3)]
+        transform.Translate(*center)
+        transform.RotateZ(rotation_z)
+        transform.Translate(*(-coord for coord in center))
+        box_widget.SetTransform(transform)
+    planes = _vtk.vtkPlanes()
+    box_widget.GetPlanes(planes)
+    return planes
+
+
+def test_box_is_collapsed():
+    from pyvista.plotting.widgets import _box_is_collapsed
+
+    pl = pv.Plotter()
+    # A normal box and a valid rotated box are not collapsed
+    assert not _box_is_collapsed(_box_planes(pl, (1, 4, 1, 4, 1, 4)))
+    assert not _box_is_collapsed(_box_planes(pl, (1, 6, 1, 6, 1, 6), rotation_z=60))
+    # A flat but valid grid is not collapsed
+    assert not _box_is_collapsed(_box_planes(pl, (0, 7, 0, 7, 0, 1)))
+    # A fully collapsed box or a single collapsed face is collapsed
+    assert _box_is_collapsed(_box_planes(pl, (4, 4, 4, 4, 4, 4)))
+    assert _box_is_collapsed(_box_planes(pl, (3, 3, 1, 5, 1, 5)))
+    pl.close()
+
+
+def _clipped_volume(pl):
+    """Return the visible dataset rendered by the clipped-volume actor.
+
+    Returns ``None`` when the clipping region is empty and the clipped actor is
+    hidden.
+    """
+    for actor in pl.renderer.actors.values():
+        if isinstance(actor, _vtk.vtkVolume) and isinstance(
+            actor.mapper, _vtk.vtkOpenGLProjectedTetrahedraMapper
+        ):
+            if not actor.GetVisibility():
+                return None
+            dataset = pv.wrap(actor.mapper.GetInput())
+            return dataset if dataset.n_cells else None
+    return None
+
+
+def _move_box(widget, bounds):
+    """Reposition a box widget and fire its end-of-interaction callback."""
+    widget.PlaceWidget(bounds)
+    widget.InvokeEvent(_vtk.vtkCommand.EndInteractionEvent)
+
+
+def test_add_volume_clip_box(uniform):
+    pl = pv.Plotter()
+    widget = pl.add_volume_clip_box(uniform, factor=1.0)
+    assert isinstance(widget, _vtk.vtkBoxWidget)
+    assert len(pl.widgets.box_widgets) == 1
+    assert _clipped_volume(pl) is not None
+    pl.close()
+
+    # An existing Volume actor is accepted and keeps rendering through the same prop
+    pl = pv.Plotter()
+    volume_actor = pl.add_volume(uniform)
+    widget = pl.add_volume_clip_box(volume_actor, factor=1.0)
+    assert _clipped_volume(pl) is not None
+    clipped_actor = next(
+        actor
+        for actor in pl.renderer.actors.values()
+        if isinstance(actor.mapper, _vtk.vtkOpenGLProjectedTetrahedraMapper)
+    )
+    assert clipped_actor.prop is volume_actor.prop
+    pl.close()
+
+    # The `name` keyword carries through to the clipped actor
+    pl = pv.Plotter()
+    pl.add_volume_clip_box(uniform, factor=1.0, name='clipped-volume')
+    named_actor = pl.renderer.actors.get('clipped-volume')
+    assert isinstance(named_actor, _vtk.vtkVolume)
+    assert isinstance(named_actor.mapper, _vtk.vtkOpenGLProjectedTetrahedraMapper)
+    pl.close()
+
+
+def test_add_volume_clip_box_scalar_bar():
+    grid = _gradient_volume()
+
+    # The scalar bar created with the volume survives the mapper replacement
+    pl = pv.Plotter()
+    pl.add_volume_clip_box(grid, factor=1.0)
+    assert len(pl.scalar_bars._scalar_bar_mappers) == 1
+    clipped_mapper = next(
+        actor.mapper
+        for actor in pl.renderer.actors.values()
+        if isinstance(actor.mapper, _vtk.vtkOpenGLProjectedTetrahedraMapper)
+    )
+    registered = next(iter(pl.scalar_bars._scalar_bar_mappers.values()))
+    assert registered == [clipped_mapper]
+    assert any(isinstance(actor, _vtk.vtkScalarBarActor) for actor in pl.renderer.actors.values())
+    pl.close()
+
+    # Disabling the scalar bar keeps none after the swap
+    pl = pv.Plotter()
+    pl.add_volume_clip_box(grid, factor=1.0, show_scalar_bar=False)
+    assert len(pl.scalar_bars._scalar_bar_mappers) == 0
+    pl.close()
+
+
+def test_add_volume_clip_box_shared_scalar_bar():
+    # Two volumes sharing one scalar-bar title: clipping one must swap only its
+    # mapper and leave the other volume's mapper registered on the same bar.
+    grid_a = _gradient_volume()
+    grid_b = _gradient_volume()
+    pl = pv.Plotter()
+    actor_a = pl.add_volume(grid_a, name='vol-a')
+    actor_b = pl.add_volume(grid_b, name='vol-b')
+    title = next(iter(pl.scalar_bars._scalar_bar_mappers))
+    assert len(pl.scalar_bars._scalar_bar_mappers[title]) == 2
+
+    pl.add_volume_clip_box(actor_a, factor=1.0)
+    registered = pl.scalar_bars._scalar_bar_mappers[title]
+    assert len(registered) == 2
+    assert actor_b.mapper in registered
+    assert actor_a.mapper not in registered
+    pl.close()
+
+
+def test_add_volume_clip_box_blending():
+    grid = _gradient_volume()
+    pl = pv.Plotter()
+    pl.add_volume_clip_box(grid, factor=1.0, blending='maximum')
+    clipped_actor = next(
+        actor
+        for actor in pl.renderer.actors.values()
+        if isinstance(actor.mapper, _vtk.vtkOpenGLProjectedTetrahedraMapper)
+    )
+    assert clipped_actor.mapper.blend_mode == 'maximum'
+    pl.close()
+
+    # The projected-tetrahedra mapper only supports composite and maximum
+    pl = pv.Plotter()
+    with pytest.raises(ValueError, match='not supported by the projected-tetrahedra'):
+        pl.add_volume_clip_box(grid, factor=1.0, blending='additive')
+    pl.close()
+
+
+def test_add_volume_clip_box_voxel_range():
+    grid = _gradient_volume()
+    pl = pv.Plotter()
+    widget = pl.add_volume_clip_box(grid, factor=1.0)
+
+    # Initially the whole volume is visible
+    full = _clipped_volume(pl)
+    assert full.bounds == grid.bounds
+
+    # A sub-box shows only the voxels within that box
+    _move_box(widget, (2, 5, 2, 5, 2, 5))
+    inside = _clipped_volume(pl)
+    assert inside.bounds.x_min == 2.0
+    assert inside.bounds.x_max == 5.0
+    assert inside.bounds.y_min == 2.0
+    assert inside.bounds.z_max == 5.0
+    assert inside.n_cells < full.n_cells
+
+    # The clipped volume renders off-screen and changes with the box
+    image = pl.screenshot(return_img=True)
+    assert image.ndim == 3
+    _move_box(widget, (1, 3, 1, 3, 1, 3))
+    assert not np.array_equal(image, pl.screenshot(return_img=True))
+
+    # Inverting shows the voxels outside the same box
+    pl.close()
+    pl = pv.Plotter()
+    widget = pl.add_volume_clip_box(grid, factor=1.0, invert=True)
+    _move_box(widget, (2, 5, 2, 5, 2, 5))
+    outside = _clipped_volume(pl)
+    assert outside.bounds.x_min < 2.0
+    assert outside.n_cells != inside.n_cells
+    pl.close()
+
+
+def test_add_volume_clip_box_collapsed_and_out_of_bounds():
+    grid = _gradient_volume()
+
+    # A collapsed box clips everything when showing the interior
+    pl = pv.Plotter()
+    widget = pl.add_volume_clip_box(grid, factor=1.0)
+    _move_box(widget, (3, 3, 3, 3, 3, 3))
+    assert _clipped_volume(pl) is None
+
+    # A single collapsed face behaves the same
+    _move_box(widget, (3, 3, 1, 5, 1, 5))
+    assert _clipped_volume(pl) is None
+    pl.close()
+
+    # Inverted, a collapsed box shows the full volume
+    pl = pv.Plotter()
+    widget = pl.add_volume_clip_box(grid, factor=1.0, invert=True)
+    _move_box(widget, (3, 3, 3, 3, 3, 3))
+    clipped = _clipped_volume(pl)
+    assert clipped is not None
+    assert clipped.bounds == grid.bounds
+    pl.close()
+
+    # A box fully outside the volume contains the whole volume
+    pl = pv.Plotter()
+    widget = pl.add_volume_clip_box(grid, factor=1.0)
+    _move_box(widget, (-50, 50, -50, 50, -50, 50))
+    clipped = _clipped_volume(pl)
+    assert clipped is not None
+    assert clipped.bounds == grid.bounds
+    pl.close()
+
+    # Inverted, the same box leaves nothing visible
+    pl = pv.Plotter()
+    widget = pl.add_volume_clip_box(grid, factor=1.0, invert=True)
+    _move_box(widget, (-50, 50, -50, 50, -50, 50))
+    assert _clipped_volume(pl) is None
+    pl.close()
+
+
+def test_add_volume_clip_box_preserves_input():
+    grid = _gradient_volume()
+    original_points = grid.points.copy()
+    original_cells = grid.n_cells
+    pl = pv.Plotter()
+    widget = pl.add_volume_clip_box(grid, factor=1.0)
+    _move_box(widget, (2, 5, 2, 5, 2, 5))
+    _move_box(widget, (3, 3, 3, 3, 3, 3))
+    assert grid.n_cells == original_cells
+    assert np.array_equal(grid.points, original_points)
+    pl.close()
+
+
+def test_add_volume_clip_box_invalid_inputs():
+    pl = pv.Plotter()
+    with pytest.raises(TypeError, match='The `volume` parameter type must'):
+        pl.add_volume_clip_box(pv.Sphere())
+
+    rectilinear = pv.RectilinearGrid(x=[0, 1, 2], y=[0, 1, 2], z=[0, 1, 2])
+    rectilinear['scalars'] = np.arange(rectilinear.n_points)
+    with pytest.raises(TypeError, match='ImageData'):
+        pl.add_volume_clip_box(rectilinear)
+
+    empty_grid = pv.ImageData()
+    empty_grid['scalars'] = np.zeros(empty_grid.n_points, dtype=np.float32)
+    with pytest.raises(ValueError, match='at least one cell'):
+        pl.add_volume_clip_box(empty_grid)
+
+    # A flat, fewer-than-three-dimensional ImageData cannot be volume-clipped
+    flat_grid = pv.ImageData(dimensions=(8, 8, 2))
+    flat_grid['scalars'] = np.arange(flat_grid.n_points, dtype=np.uint8)
+    with pytest.raises(ValueError, match='three-dimensional'):
+        pl.add_volume_clip_box(flat_grid)
+
+    volume_actor = pl.add_volume(pv.examples.load_uniform())
+    with pytest.raises(TypeError):
+        pl.add_volume_clip_box(volume_actor, cmap='bwr')
+    pl.close()
+
+    # A Volume actor whose mapper does not render an ImageData is rejected
+    unstructured = pv.ImageData(dimensions=(4, 4, 4)).cast_to_unstructured_grid()
+    unstructured['scalars'] = np.arange(unstructured.n_points, dtype=np.uint8)
+    pl = pv.Plotter()
+    unstructured_actor = pl.add_volume(unstructured)
+    with pytest.raises(TypeError, match='ImageData'):
+        pl.add_volume_clip_box(unstructured_actor)
+    pl.close()
+
+
+def test_add_volume_clip_box_interaction_updates(uniform):
+    pl = pv.Plotter()
+    widget = pl.add_volume_clip_box(uniform, factor=1.0, interaction_event='always')
+    first = _clipped_volume(pl)
+    assert first is not None
+    first_cells = first.n_cells
+
+    widget.PlaceWidget((2, 6, 2, 6, 2, 6))
+    widget.InvokeEvent(_vtk.vtkCommand.InteractionEvent)
+    second = _clipped_volume(pl)
+
+    assert second is not None
+    assert second.n_cells != first_cells
+    pl.close()
+
+
 def test_plot_pointset_widgets(pointset):
     pointset = pointset.elevation()
 

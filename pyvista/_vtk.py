@@ -400,6 +400,7 @@ _CORE_MODULES: dict[str, tuple[str, ...]] = {
         'vtkBoxClipDataSet',
         'vtkCellValidator',
         'vtkClipClosedSurface',
+        'vtkClipVolume',
         'vtkContourTriangulator',
         'vtkCursor3D',
         'vtkCurvatures',
@@ -832,6 +833,7 @@ _OPENGL_MODULES: dict[str, tuple[str, ...]] = {
     ),
     'vtkRenderingVolumeOpenGL2': (
         'vtkOpenGLGPUVolumeRayCastMapper',
+        'vtkOpenGLProjectedTetrahedraMapper',
         'vtkSmartVolumeMapper',
     ),
 }

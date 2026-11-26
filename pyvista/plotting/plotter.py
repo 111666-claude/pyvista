@@ -8311,6 +8311,11 @@ class BasePlotter(_BoundsSizeMixin):
         """Forward to :meth:`~pyvista.plotting.widgets.WidgetComponent.add_volume_clip_plane`."""
         return self.widgets.add_volume_clip_plane(*args, **kwargs)
 
+    @_wraps(WidgetComponent.add_volume_clip_box)
+    def add_volume_clip_box(self, *args, **kwargs) -> Any:  # numpydoc ignore=PR01,RT01
+        """Forward to :meth:`~pyvista.plotting.widgets.WidgetComponent.add_volume_clip_box`."""
+        return self.widgets.add_volume_clip_box(*args, **kwargs)
+
     @_wraps(WidgetComponent.add_mesh_slice)
     def add_mesh_slice(self, *args, **kwargs) -> Any:  # numpydoc ignore=PR01,RT01
         """Forward to :meth:`~pyvista.plotting.widgets.WidgetComponent.add_mesh_slice`."""

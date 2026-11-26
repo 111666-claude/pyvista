@@ -615,6 +615,7 @@ _RENDERING_MODULES = frozenset(
         'typing/cases/plotting/add_text.py',
         'typing/cases/plotting/add_title.py',
         'typing/cases/plotting/add_volume.py',
+        'typing/cases/plotting/add_volume_clip_box.py',
         'typing/cases/plotting/add_volume_clip_plane.py',
         'typing/cases/plotting/compute_bounds.py',
         'typing/cases/plotting/enable_depth_peeling.py',
