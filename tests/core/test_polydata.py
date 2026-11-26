@@ -1718,6 +1718,267 @@ def test_delaunay_2d():
     assert np.allclose(pdata.points, surf.points)
 
 
+def _polygon_area(points):
+    """Compute the area of a polygon independently with the shoelace formula."""
+    x = points[:, 0]
+    y = points[:, 1]
+    return 0.5 * np.abs(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
+
+
+def _circular_loop(center, radius, n_sides, *, ccw, start=0.0):
+    theta = np.linspace(start, start + 2 * np.pi, n_sides, endpoint=False)
+    if not ccw:
+        theta = theta[::-1]
+    x = center[0] + radius * np.cos(theta)
+    y = center[1] + radius * np.sin(theta)
+    return np.column_stack([x, y, np.zeros(n_sides)])
+
+
+def _polydata_from_loops(loops):
+    points = np.vstack(loops)
+    faces = []
+    offset = 0
+    for loop in loops:
+        n_points = loop.shape[0]
+        faces.append(np.hstack([[n_points], np.arange(offset, offset + n_points)]))
+        offset += n_points
+    return pv.PolyData(points, np.concatenate(faces))
+
+
+def _constraint_edge_set(mesh):
+    edge_mesh = mesh.extract_all_edges()
+    connectivity = edge_mesh.lines
+    edges = set()
+    index = 0
+    while index < connectivity.size:
+        n_points = connectivity[index]
+        cell = connectivity[index + 1 : index + 1 + n_points]
+        for i in range(n_points - 1):
+            edges.add(tuple(sorted((int(cell[i]), int(cell[i + 1])))))
+        index += 1 + n_points
+    return edges
+
+
+def _missing_constraint_edges(source, tessellated):
+    edges = _constraint_edge_set(tessellated)
+    missing = 0
+    for face in source.irregular_faces:
+        ids = np.asarray(face)
+        if ids.size > 1 and np.allclose(source.points[ids[0]], source.points[ids[-1]]):
+            ids = ids[:-1]
+        for i in range(ids.size):
+            edge = tuple(sorted((int(ids[i]), int(ids[(i + 1) % ids.size]))))
+            missing += edge not in edges
+    return missing
+
+
+@pytest.fixture
+def constrained_loops():
+    # Outer square of side 12 with two regular 12-sided holes of radius 2.
+    outer = np.array([[-6, -6, 0], [6, -6, 0], [6, 6, 0], [-6, 6, 0]], dtype=float)
+    hole_one = _circular_loop((-3, 0), 2.0, 12, ccw=False)
+    hole_two = _circular_loop((3, 0), 2.0, 12, ccw=False)
+    return outer, hole_one, hole_two
+
+
+def test_delaunay_2d_constrained_winding_invariant(constrained_loops):
+    outer, hole_one, hole_two = constrained_loops
+    reference_area = _polygon_area(outer) - _polygon_area(hole_one) - _polygon_area(hole_two)
+
+    loop_variants = [
+        [outer, hole_one, hole_two],
+        [outer[::-1], hole_one, hole_two],
+        [outer, hole_one[::-1], hole_two],
+        [outer, hole_one, hole_two[::-1]],
+        [outer[::-1], hole_one[::-1], hole_two[::-1]],
+        [outer, np.roll(hole_one, 5, axis=0), np.roll(hole_two, 7, axis=0)],
+    ]
+    areas = []
+    cell_counts = []
+    for loops in loop_variants:
+        source = _polydata_from_loops(loops)
+        tessellated = source.delaunay_2d(edge_source=source)
+        areas.append(tessellated.area)
+        cell_counts.append(tessellated.n_cells)
+        assert _missing_constraint_edges(source, tessellated) == 0
+
+    assert np.allclose(areas, reference_area)
+    assert len(set(cell_counts)) == 1
+
+    # No triangle centroid falls inside either hole.
+    source = _polydata_from_loops([outer, hole_one, hole_two])
+    tessellated = source.delaunay_2d(edge_source=source)
+    centroids = tessellated.cell_centers().points
+    for center in ((-3.0, 0.0), (3.0, 0.0)):
+        radii = np.hypot(centroids[:, 0] - center[0], centroids[:, 1] - center[1])
+        assert np.all(radii >= 2.0)
+
+
+def test_delaunay_2d_constrained_closed_loops(constrained_loops):
+    loops = [np.vstack([loop, loop[:1]]) for loop in constrained_loops]
+    source = _polydata_from_loops(loops)
+    outer, hole_one, hole_two = constrained_loops
+    reference_area = _polygon_area(outer) - _polygon_area(hole_one) - _polygon_area(hole_two)
+
+    tessellated = source.delaunay_2d(edge_source=source)
+    assert tessellated.area == pytest.approx(reference_area)
+    assert _missing_constraint_edges(source, tessellated) == 0
+
+
+def test_delaunay_2d_constrained_single_loop():
+    # A single loop keeps its interior regardless of winding.
+    loop = _circular_loop((0, 0), 3.0, 12, ccw=True)
+    reference_area = _polygon_area(loop)
+    areas = []
+    for points in (loop, loop[::-1]):
+        source = pv.PolyData(points, np.hstack([[points.shape[0]], np.arange(points.shape[0])]))
+        tessellated = source.delaunay_2d(edge_source=source)
+        areas.append(tessellated.area)
+    assert np.allclose(areas, reference_area)
+
+
+@pytest.mark.parametrize(
+    ('loops', 'match'),
+    [
+        # Bowtie: self-intersecting loop
+        (
+            [np.array([[0, 0, 0], [2, 2, 0], [2, 0, 0], [0, 2, 0]], dtype=float)],
+            'Self-intersecting',
+        ),
+        # Two crossing loops
+        (
+            [
+                np.array([[-6, -6, 0], [6, -6, 0], [6, 6, 0], [-6, 6, 0]], float),
+                np.array([[-7, 0, 0], [7, 0, 0], [7, 1, 0], [-7, 1, 0]], float),
+            ],
+            'Intersecting',
+        ),
+        # Collinear loop encloses no area
+        ([np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0]], dtype=float)], 'non-zero area'),
+        # Loop nested inside a hole is unsupported by the underlying fill
+        (
+            'nested',
+            'nested inside a hole',
+        ),
+    ],
+)
+def test_delaunay_2d_constrained_invalid_loops(loops, match):
+    if loops == 'nested':
+        outer = np.array([[-8, -8, 0], [8, -8, 0], [8, 8, 0], [-8, 8, 0]], dtype=float)
+        middle = _circular_loop((0, 0), 5.0, 20, ccw=True)
+        inner = _circular_loop((0, 0), 2.0, 20, ccw=False)
+        loops = [outer, middle, inner]
+    source = _polydata_from_loops(loops)
+    with pytest.raises(ValueError, match=match):
+        source.delaunay_2d(edge_source=source)
+
+
+def test_delaunay_2d_constrained_repeated_points():
+    # A non-closing vertex repeats another point's coordinate under a
+    # distinct point id.
+    points = np.array([[0, 0, 0], [4, 0, 0], [4, 4, 0], [0, 4, 0], [4, 0, 0]], dtype=float)
+    source = pv.PolyData(points, np.array([5, 0, 1, 2, 3, 4]))
+    with pytest.raises(ValueError, match='repeated points'):
+        source.delaunay_2d(edge_source=source)
+
+
+def test_delaunay_2d_constrained_lines_only():
+    # Sources without polygons pass through and keep working.
+    points = np.array([[0, 0, 0], [4, 0, 0], [4, 4, 0], [0, 4, 0]], dtype=float)
+    source = pv.PolyData(points)
+    source.lines = np.array([4, 0, 1, 2, 3])
+    tessellated = source.delaunay_2d(edge_source=source)
+    assert tessellated.n_cells > 0
+
+
+def test_delaunay_2d_constrained_open_lines_passthrough():
+    # Open line cells constrain edges but never fill, so they are not
+    # validated as closed polygon loops.
+    points = np.array([[0, 0, 0], [4, 0, 0], [4, 4, 0], [0, 4, 0]], dtype=float)
+    source = pv.PolyData(points)
+    source.lines = np.array([2, 0, 1])
+    tessellated = source.delaunay_2d(edge_source=source)
+    assert tessellated.n_cells > 0
+
+    # An open polyline whose fictitious closing edge would cross is accepted.
+    open_source = pv.PolyData(points)
+    open_source.lines = np.array([4, 0, 1, 2, 3])
+    assert open_source.delaunay_2d(edge_source=open_source).n_cells > 0
+
+
+def test_delaunay_2d_constrained_coincident_rotated_loops():
+    # A line cell and a face over the same boundary with a rotated start
+    # describe one loop and must not be flagged as intersecting.
+    points = np.array([[0, 0, 0], [4, 0, 0], [4, 4, 0], [0, 4, 0]], dtype=float)
+    source = pv.PolyData(points)
+    source.lines = np.array([4, 0, 1, 2, 3])
+    source.irregular_faces = (np.array([1, 2, 3, 0]),)
+    tessellated = source.delaunay_2d(edge_source=source)
+    assert tessellated.n_cells > 0
+
+
+@pytest.mark.parametrize('tilt', [0, 10, 45, 89, 90])
+def test_delaunay_2d_constrained_tilted_plane(tilt):
+    # Geometry is evaluated in the best-fitting plane, so a loop tilted out of
+    # the xy plane is normalized just like an axis-aligned one.
+    square = np.array([[-2.0, -2, 0], [2, -2, 0], [2, 2, 0], [-2, 2, 0]], dtype=float)
+    points = pv.PolyData(square).rotate_x(tilt, inplace=False).points
+    areas = []
+    for connectivity in ([4, 0, 1, 2, 3], [4, 3, 2, 1, 0]):
+        source = pv.PolyData(points, np.array(connectivity))
+        tessellated = source.delaunay_2d(edge_source=source)
+        areas.append(tessellated.area)
+    assert np.allclose(areas, 16.0)
+
+
+def test_delaunay_2d_constrained_wide_scale_range():
+    # Collinearity and area tests are scale independent.
+    outer = np.array(
+        [[-1e5, -1e5, 0], [1e5, -1e5, 0], [1e5, 1e5, 0], [-1e5, 1e5, 0]],
+        dtype=float,
+    )
+    hole = _circular_loop((0, 0), 100.0, 24, ccw=True)
+    source = _polydata_from_loops([outer, hole])
+    tessellated = source.delaunay_2d(edge_source=source)
+    reference = (2e5) ** 2 - _polygon_area(hole)
+    assert tessellated.area == pytest.approx(reference, rel=1e-3)
+
+
+def test_delaunay_2d_constrained_line_boundary_polygon_hole():
+    # A closed line loop bounds the region but does not fill; a polygon inside
+    # it keeps its own interior regardless of input winding.
+    boundary = np.array([[-8.0, -8, 0], [8, -8, 0], [8, 8, 0], [-8, 8, 0]], dtype=float)
+    circle = _circular_loop((0, 0), 3.0, 24, ccw=True)
+    points = np.vstack([boundary, circle])
+    areas = []
+    for reversed_circle in (False, True):
+        loop = circle[::-1] if reversed_circle else circle
+        source = pv.PolyData(points)
+        source.lines = np.array([4, 0, 1, 2, 3])
+        source.faces = np.hstack([[loop.shape[0]], np.arange(4, 4 + loop.shape[0])])
+        tessellated = source.delaunay_2d(edge_source=source)
+        areas.append(tessellated.area)
+    assert np.allclose(areas, _polygon_area(circle))
+
+
+def test_delaunay_2d_constrained_touching_loops_rejected():
+    # Two loops sharing a vertex have ambiguous containment and are rejected.
+    first = np.array([[0.0, 0, 0], [4, 0, 0], [4, 4, 0], [0, 4, 0]])
+    second = np.array([[0.0, 0, 0], [-4, 0, 0], [-4, -4, 0], [0, -4, 0]])
+    source = _polydata_from_loops([first, second])
+    with pytest.raises(ValueError, match='Intersecting'):
+        source.delaunay_2d(edge_source=source)
+
+
+def test_delaunay_2d_constrained_preserves_vertex_cells():
+    points = np.array([[-4.0, -4, 0], [4, -4, 0], [4, 4, 0], [-4, 4, 0], [0, 0, 0]], dtype=float)
+    source = pv.PolyData(points)
+    source.irregular_faces = (np.array([0, 1, 2, 3]),)
+    source.verts = np.array([1, 4])
+    tessellated = source.delaunay_2d(edge_source=source)
+    assert tessellated.n_cells > 0
+
+
 def test_lines():
     theta = np.linspace(-4 * np.pi, 4 * np.pi, 100)
     z = np.linspace(-2, 2, 100)

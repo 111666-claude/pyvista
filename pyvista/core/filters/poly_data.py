@@ -140,6 +140,312 @@ def _check_all_triangles(*meshes: PolyData, operation: str) -> None:
         raise NotAllTrianglesError(msg)
 
 
+def _constraint_plane_frame(
+    points: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+    """Return the origin and two in-plane axes of VTK's best-fitting plane.
+
+    The frame matches ``vtkDelaunay2D::ComputeBestFittingPlane`` so that 2D
+    winding computed here agrees with the winding VTK uses to mark holes.
+    """
+    widths = np.ptp(points, axis=0)
+    length = float(np.linalg.norm(widths))
+    axis = int(np.argmin(widths))
+    if widths[axis] <= length * 1.0e-3:
+        normal = np.zeros(3)
+        normal[axis] = 1.0
+        origin = (points.max(axis=0) + points.min(axis=0)) / 2.0
+    else:
+        vtk_points = _vtk.vtkPoints()
+        for point in points:
+            vtk_points.InsertNextPoint(point.tolist())
+        origin = [0.0, 0.0, 0.0]
+        normal = [0.0, 0.0, 0.0]
+        _vtk.vtkPlane.ComputeBestFittingPlane(vtk_points, origin, normal)
+        origin = np.asarray(origin)
+        normal = np.asarray(normal)
+    normal = normal / np.linalg.norm(normal)
+    reference = np.array([1.0, 0.0, 0.0]) if abs(normal[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    u = reference - np.dot(reference, normal) * normal
+    u /= np.linalg.norm(u)
+    # u x v = normal, matching the xy frame whose normal is +z.
+    v = np.cross(normal, u)
+    return origin, u, v
+
+
+def _project_to_plane(
+    points: NDArray[np.float64],
+    *,
+    origin: NDArray[np.float64],
+    u: NDArray[np.float64],
+    v: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Project 3D points onto the 2D coordinates of a fitted plane."""
+    delta = points - origin
+    return np.column_stack([delta @ u, delta @ v])
+
+
+def _edges_intersect_2d(
+    edges_a: NDArray[np.float64],
+    edges_b: NDArray[np.float64],
+    *,
+    angle_tol: float,
+    length_tol: float,
+) -> NDArray[np.bool_]:
+    """Vectorized test of which edge pairs from two sets cross in 2D.
+
+    Each input has shape ``(n, 2, 2)`` as ``n`` edges of two endpoints. The
+    returned array has shape ``(n, m)``. Cross products are normalized by the
+    participating edge lengths so collinearity is an angle test independent of
+    the coordinate scale.
+    """
+    p = edges_a[:, None, 0]
+    q = edges_a[:, None, 1]
+    r = edges_b[None, :, 0]
+    s = edges_b[None, :, 1]
+    qp = q - p
+    sr = s - r
+    len_qp = np.linalg.norm(qp, axis=-1)
+    len_sr = np.linalg.norm(sr, axis=-1)
+
+    def cross(a: NDArray[np.float64], b: NDArray[np.float64]) -> NDArray[np.float64]:
+        return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
+
+    rqp = cross(r - p, qp)
+    sqp = cross(s - p, qp)
+    psr = cross(p - r, sr)
+    qsr = cross(q - r, sr)
+    # Normalized crosses are sines of angles, hence bounded and scale-free.
+    denom = np.maximum(len_qp * len_sr, np.finfo(float).tiny)
+    rqp_n = rqp / denom
+    sqp_n = sqp / denom
+    psr_n = psr / denom
+    qsr_n = qsr / denom
+    proper = (rqp_n * sqp_n < -angle_tol) & (psr_n * qsr_n < -angle_tol)
+
+    def on_segment(
+        point: NDArray[np.float64],
+        start: NDArray[np.float64],
+        end: NDArray[np.float64],
+        *,
+        edge_len: NDArray[np.float64],
+        normalized_cross: NDArray[np.float64],
+    ) -> NDArray[np.bool_]:
+        collinear = np.abs(normalized_cross) <= angle_tol
+        within = (
+            (np.minimum(start[..., 0], end[..., 0]) - length_tol <= point[..., 0])
+            & (point[..., 0] <= np.maximum(start[..., 0], end[..., 0]) + length_tol)
+            & (np.minimum(start[..., 1], end[..., 1]) - length_tol <= point[..., 1])
+            & (point[..., 1] <= np.maximum(start[..., 1], end[..., 1]) + length_tol)
+        )
+        # Zero-length edges cannot bound any region and are handled elsewhere.
+        return collinear & within & (edge_len > length_tol)
+
+    contact = (
+        (
+            (np.abs(rqp_n) <= angle_tol)
+            & on_segment(r, p, q, edge_len=len_qp, normalized_cross=rqp_n)
+        )
+        | (
+            (np.abs(sqp_n) <= angle_tol)
+            & on_segment(s, p, q, edge_len=len_qp, normalized_cross=sqp_n)
+        )
+        | (
+            (np.abs(psr_n) <= angle_tol)
+            & on_segment(p, r, s, edge_len=len_sr, normalized_cross=psr_n)
+        )
+        | (
+            (np.abs(qsr_n) <= angle_tol)
+            & on_segment(q, r, s, edge_len=len_sr, normalized_cross=qsr_n)
+        )
+    )
+    return proper | contact
+
+
+def _point_in_loop_2d(
+    point: NDArray[np.float64], loop: NDArray[np.float64], *, length_tol: float
+) -> bool:
+    """Check whether a 2D point is strictly inside a closed polygon loop."""
+    x = point[0]
+    y = point[1]
+    inside = False
+    previous = loop[-1]
+    for current in loop:
+        xi, yi = current
+        xj, yj = previous
+        if (yi > y) != (yj > y):
+            x_intersect = (xj - xi) * (y - yi) / (yj - yi) + xi
+            if abs(x - x_intersect) <= length_tol:
+                return False
+            if x > x_intersect:
+                inside = not inside
+        previous = current
+    return inside
+
+
+def _signed_area_2d(loop: NDArray[np.float64]) -> float:
+    """Return the signed area of a closed 2D polygon loop."""
+    x = loop[:, 0]
+    y = loop[:, 1]
+    return 0.5 * float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
+
+
+def _normalize_constraint_source(edge_source: PolyData) -> PolyData:
+    """Normalize the polygon loops of a constrained Delaunay source.
+
+    ``vtkDelaunay2D`` determines inside and outside purely from polygon
+    winding: counterclockwise loops keep their interior and clockwise loops
+    carve holes. Line cells only constrain edges and never fill a region, so
+    open lines pass through untouched and closed lines are checked for
+    validity but excluded from inside/outside classification. VTK treats the
+    last point of every polygon as distinct from the first, so repeated
+    closing points are removed. Geometry is evaluated in the filter's
+    best-fitting plane rather than the xy projection.
+
+    Raises
+    ------
+    ValueError
+        If a polygon loop, or a closed line loop, has fewer than three
+        distinct points, encloses no area, intersects itself or another loop,
+        or is nested inside a hole.
+
+    """
+    if edge_source.n_faces == 0 and edge_source.n_lines == 0:
+        return edge_source
+
+    points = np.asarray(edge_source.points, dtype=np.float64)
+    origin, u, v = _constraint_plane_frame(points)
+    projected = _project_to_plane(points, origin=origin, u=u, v=v)
+
+    scale = float(np.linalg.norm(np.ptp(projected, axis=0)))
+    length_tol = 1e-9 * scale if scale > 0.0 else 1e-9
+    angle_tol = 1e-9
+
+    def legacy_cells(connectivity: NDArray[np.integer]) -> list[NDArray[np.integer]]:
+        cells = []
+        index = 0
+        while index < connectivity.size:
+            n_points = connectivity[index]
+            start = index + 1
+            cells.append(np.asarray(connectivity[start : start + n_points]))
+            index = start + n_points
+        return cells
+
+    def clean_loop(raw_ids: NDArray[np.integer]) -> NDArray[np.integer]:
+        ids = np.asarray(raw_ids)
+        if ids.size >= 2 and np.linalg.norm(points[ids[-1]] - points[ids[0]]) <= length_tol:
+            ids = ids[:-1]
+        if ids.size < 3:
+            msg = 'Constraint loops must contain at least three distinct points.'
+            raise ValueError(msg)
+        if (
+            np.unique(ids).size != ids.size
+            or np.unique(projected[ids], axis=0).shape[0] != ids.size
+        ):
+            msg = 'Constraint loops must not contain repeated points.'
+            raise ValueError(msg)
+        return ids
+
+    # Only closed line cells describe a loop. Open line cells constrain
+    # individual edges in VTK but never fill a region, so they are passed
+    # through untouched rather than validated as polygons.
+    line_loops: list[NDArray[np.integer]] = []
+    for line in legacy_cells(edge_source.lines):
+        ids = np.asarray(line)
+        is_closed = (
+            ids.size >= 3 and np.linalg.norm(points[ids[-1]] - points[ids[0]]) <= length_tol
+        )
+        if is_closed:
+            line_loops.append(clean_loop(line))
+    polygon_loops: list[NDArray[np.integer]] = [
+        clean_loop(face) for face in edge_source.irregular_faces
+    ]
+    loops_ids = line_loops + polygon_loops
+    loops_2d = [projected[ids] for ids in loops_ids]
+    n_line_loops = len(line_loops)
+    n_loops = len(loops_2d)
+
+    def loop_edges(loop: NDArray[np.float64]) -> NDArray[np.float64]:
+        return np.stack([loop, np.roll(loop, -1, axis=0)], axis=1)
+
+    for loop in loops_2d:
+        edges = loop_edges(loop)
+        hits = _edges_intersect_2d(edges, edges, angle_tol=angle_tol, length_tol=length_tol)
+        n_edges = edges.shape[0]
+        # Ignore an edge paired with itself or either of its adjacent edges.
+        for a in range(n_edges):
+            for b in range(a + 1, n_edges):
+                if len({a, (a + 1) % n_edges, b, (b + 1) % n_edges}) < 4:
+                    continue
+                if hits[a, b]:
+                    msg = 'Self-intersecting constraint loops are not supported.'
+                    raise ValueError(msg)
+
+    # A filled polygon carries both a closed line cell and a face over the
+    # same boundary, so coincident loops describe one boundary and must not be
+    # treated as intersecting each other. The comparison is independent of the
+    # start vertex and winding direction.
+    def coincident(loop_a: NDArray[np.float64], loop_b: NDArray[np.float64]) -> bool:
+        if loop_a.shape != loop_b.shape:
+            return False
+        order_a = np.lexsort((loop_a[:, 1], loop_a[:, 0]))
+        order_b = np.lexsort((loop_b[:, 1], loop_b[:, 0]))
+        return bool(np.allclose(loop_a[order_a], loop_b[order_b], atol=length_tol))
+
+    for i in range(n_loops):
+        for j in range(i + 1, n_loops):
+            if coincident(loops_2d[i], loops_2d[j]):
+                continue
+            edges_i = loop_edges(loops_2d[i])
+            edges_j = loop_edges(loops_2d[j])
+            if np.any(
+                _edges_intersect_2d(edges_i, edges_j, angle_tol=angle_tol, length_tol=length_tol)
+            ):
+                msg = 'Intersecting constraint loops are not supported.'
+                raise ValueError(msg)
+
+    areas = np.array([_signed_area_2d(loop) for loop in loops_2d])
+    area_tol = length_tol**2
+    if np.any(np.abs(areas) <= area_tol):
+        msg = 'Constraint loops must enclose a non-zero area.'
+        raise ValueError(msg)
+
+    # Line cells never fill, so only polygon loops define inside and outside.
+    # A polygon is a hole when another polygon contains it; the outermost
+    # polygons are boundaries. A representative vertex is enough because loops
+    # do not cross.
+    n_polygon_loops = n_loops - n_line_loops
+    containment = np.zeros((n_polygon_loops, n_polygon_loops), dtype=bool)
+    polygon_loops_2d = loops_2d[n_line_loops:]
+    for i, loop in enumerate(polygon_loops_2d):
+        for j, other in enumerate(polygon_loops_2d):
+            if i != j and _point_in_loop_2d(loop[0], other, length_tol=length_tol):
+                containment[i, j] = True
+    nesting_depth = containment.sum(axis=1)
+    if np.any(nesting_depth > 1):
+        msg = 'Loops nested inside a hole are not supported.'
+        raise ValueError(msg)
+    is_hole = nesting_depth.astype(bool)
+
+    # Polygons are oriented so boundaries are counterclockwise and holes
+    # clockwise. Line winding is left untouched because VTK ignores it.
+    normalized_faces: list[NDArray[np.integer]] = []
+    for k, face_ids in enumerate(polygon_loops):
+        positive_area = areas[n_line_loops + k] > 0.0
+        normalized = face_ids[::-1] if is_hole[k] == positive_area else face_ids
+        normalized_faces.append(normalized)
+
+    source = pv.PolyData()
+    source.points = edge_source.points
+    if normalized_faces:
+        source.irregular_faces = normalized_faces
+    if edge_source.n_lines:
+        source.lines = edge_source.lines
+    if edge_source.n_verts:
+        source.verts = edge_source.verts
+    return source
+
+
 @abstract_class
 class PolyDataFilters(DataSetFilters):
     """An internal class to manage filters/algorithms for polydata datasets."""
@@ -3886,7 +4192,15 @@ class PolyDataFilters(DataSetFilters):
             constrained triangulation is created. The lines/polygons
             are assumed to reference points in the input point set
             (that is, point ids are identical in the input and
-            source).
+            source). Polygon winding is normalized automatically:
+            outermost loops are oriented counterclockwise and enclosed
+            loops clockwise, so the same loops produce the same
+            triangulation regardless of their starting point or
+            winding. A repeated point closing a loop is removed.
+
+            .. versionchanged:: 0.50.0
+                Polygon winding and repeated closing points are now
+                normalized, and invalid loops raise a ``ValueError``.
 
         progress_bar : bool, default: False
             Display a progress bar to indicate progress.
@@ -3895,6 +4209,13 @@ class PolyDataFilters(DataSetFilters):
         -------
         pyvista.PolyData
             Mesh from the 2D Delaunay filter.
+
+        Raises
+        ------
+        ValueError
+            If a polygon in ``edge_source`` has fewer than three
+            distinct points, encloses no area, intersects itself or
+            another polygon, or is nested inside a hole polygon.
 
         Examples
         --------
@@ -3913,9 +4234,11 @@ class PolyDataFilters(DataSetFilters):
         >>> filled_circle.plot(show_edges=True, line_width=5)
 
         Use the ``edge_source`` parameter to create a constrained Delaunay
-        triangulation and plot it.
+        triangulation and plot it. The outer boundary is a counterclockwise
+        polygon and the enclosed polygons are treated as holes regardless of
+        their input winding.
 
-        >>> squar = pv.Polygon(n_sides=4, radius=8, fill=False)
+        >>> squar = pv.Polygon(n_sides=4, radius=8)
         >>> squar = squar.rotate_z(45, inplace=False)
         >>> circ0 = pv.Polygon(center=(2, 3, 0), n_sides=30, radius=1)
         >>> circ1 = pv.Polygon(center=(-2, -3, 0), n_sides=30, radius=1)
@@ -3932,6 +4255,7 @@ class PolyDataFilters(DataSetFilters):
         alg.SetOffset(offset)
         alg.SetBoundingTriangulation(bound)
         if edge_source is not None:
+            edge_source = _normalize_constraint_source(edge_source)
             alg.SetSourceData(edge_source)
         _update_alg(alg, progress_bar=progress_bar, message='Computing 2D Triangulation')
 

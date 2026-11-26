@@ -81,20 +81,36 @@ surf.plot(cpos='xy', show_edges=True)
 
 
 # %%
-# We could also add a polygon to ignore during the triangulation via the
-# ``edge_source`` parameter.
+# We could also constrain the triangulation to keep an outer boundary and
+# carve out a hole through the ``edge_source`` parameter. Polygon winding is
+# normalized automatically: the outermost polygon keeps its interior and any
+# enclosed polygon becomes a hole regardless of the winding used to define it.
 
-# Define a polygonal hole with a clockwise polygon
-ids = [22, 23, 24, 25, 35, 45, 44, 43, 42, 32]
+# Define a polygonal hole from a subset of the point ids
+hole_ids = [22, 23, 24, 25, 35, 45, 44, 43, 42, 32]
 
-# Create a polydata to store the boundary
+# Build an outer boundary around the point cloud extent
+margin = 0.5
+xmin, xmax = points[:, 0].min() - margin, points[:, 0].max() + margin
+ymin, ymax = points[:, 1].min() - margin, points[:, 1].max() + margin
+outer_ids = [
+    cloud.find_closest_point((xmin, ymin, 0.0)),
+    cloud.find_closest_point((xmax, ymin, 0.0)),
+    cloud.find_closest_point((xmax, ymax, 0.0)),
+    cloud.find_closest_point((xmin, ymax, 0.0)),
+]
+
+# Create a polydata with the same points; its faces define the boundary and hole
 polygon = pv.PolyData()
-# Make sure it has the same points as the mesh being triangulated
 polygon.points = points
-# But only has faces in regions to ignore
-polygon.faces = np.insert(ids, 0, len(ids))
+polygon.faces = np.concatenate(
+    [
+        np.insert(outer_ids, 0, len(outer_ids)),
+        np.insert(hole_ids, 0, len(hole_ids)),
+    ]
+)
 
-surf = cloud.delaunay_2d(alpha=1.0, edge_source=polygon)
+surf = cloud.delaunay_2d(edge_source=polygon)
 
 pl = pv.Plotter()
 pl.add_mesh(surf, show_edges=True)
