@@ -13,6 +13,7 @@ import pyvista as pv
 from pyvista import _vtk
 from pyvista.core._vtk_utilities import DisableVtkSnakeCase
 from pyvista.core.errors import PyVistaPipelineError
+from pyvista.core.utilities.arrays import convert_array
 from pyvista.core.utilities.helpers import wrap
 from pyvista.core.utilities.misc import _NoNewAttrMixin
 
@@ -413,13 +414,37 @@ class ActiveScalarsAlgorithm(PreserveTypeAlgorithmBase):
         scalars to be associated with the mesh points. Can be
         either ``'point'`` or ``'cell'``.
 
+    rgba_baker : callable, optional
+        Callable invoked with the shallow-copied input dataset on each
+        pipeline execution. It must return an ``(n, 4)`` uint8 RGBA array
+        to install under :attr:`scalars_name` as direct colors. The baker
+        reads its source arrays from the live input, so in-place edits and
+        array reassignment are reflected on the next update. When ``None``
+        (the default), only the active scalars are set.
+
     """
 
-    def __init__(self, name: str, preference: PointLiteral | CellLiteral = 'point') -> None:
+    def __init__(
+        self,
+        name: str,
+        preference: PointLiteral | CellLiteral = 'point',
+        rgba_baker: Callable[[DataSet], Any] | None = None,
+    ) -> None:
         """Initialize algorithm."""
         super().__init__()
         self._scalars_name = name
         self._preference: PointLiteral | CellLiteral = preference
+        self._rgba_baker = rgba_baker
+
+    @property
+    def rgba_baker(self) -> Callable[[DataSet], Any] | None:  # numpydoc ignore=RT01
+        """Return or set the callable that bakes a direct RGBA array."""
+        return self._rgba_baker
+
+    @rgba_baker.setter
+    def rgba_baker(self, baker: Callable[[DataSet], Any] | None) -> None:
+        self._rgba_baker = baker
+        self.Modified()
 
     @property
     def scalars_name(self) -> str:  # numpydoc ignore=RT01
@@ -470,6 +495,7 @@ class ActiveScalarsAlgorithm(PreserveTypeAlgorithmBase):
             inp = self.GetInputData(inInfo, 0, 0)
             out = self.GetOutputData(outInfo, 0)
             out.ShallowCopy(inp)
+            self._bake_rgba(inp, out)
             # Set active scalars directly via VTK API on the output object.
             # Using wrap(out) would create a new VTK object rather than
             # wrapping the existing one, so changes would be lost.
@@ -481,6 +507,19 @@ class ActiveScalarsAlgorithm(PreserveTypeAlgorithmBase):
             traceback.print_exc()
             raise
         return 1
+
+    def _bake_rgba(self, inp: DataSet, out: _vtk.vtkDataSet) -> None:
+        """Bake direct RGBA colors onto the shallow output when configured."""
+        if self._rgba_baker is None:
+            return
+        rgba = np.ascontiguousarray(self._rgba_baker(inp))
+        vtk_array = convert_array(rgba, name=self.scalars_name, deep=True)
+        attributes = out.GetCellData() if self.preference == 'cell' else out.GetPointData()
+        # The shallow copy shares the input's arrays, including a stale array
+        # of the same name. Remove the inherited reference before installing
+        # this mapper's own freshly baked array.
+        attributes.RemoveArray(self.scalars_name)
+        attributes.AddArray(vtk_array)
 
 
 class SmoothShadingAlgorithm(_NoNewAttrMixin, DisableVtkSnakeCase, _vtk.VTKPythonAlgorithmBase):

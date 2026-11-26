@@ -179,6 +179,27 @@ def _apply_categories(
     return [float(v) for v in values[::stride] if float(v) not in annotated]
 
 
+def _bake_custom_opacity_rgba(
+    scalars: _AnyArrayLike,
+    *,
+    opacity: NDArray[_Real],
+    cmap: ColormapOptions,
+    scalar_range: tuple[float, float],
+    n_colors: int,
+) -> NDArray[np.uint8]:
+    """Map scalars through ``cmap`` and scale alpha by a per-point opacity."""
+    scalars = np.asarray(scalars)
+    # Round the colors here since these values are displayed directly.
+    if scalar_range[0] != scalar_range[1]:
+        hue = normalize(scalars, minimum=scalar_range[0], maximum=scalar_range[1])
+    else:
+        hue = np.zeros(scalars.shape)
+    rounded = np.round(hue * n_colors) / n_colors
+    rgba: NDArray[np.floating] = get_cmap_safe(cmap)(rounded) * 255
+    rgba[:, -1] *= opacity
+    return rgba.astype(np.uint8)
+
+
 @abstract_class
 class _BaseMapper(_NoNewAttrMixin, _BoundsSizeMixin, DisableVtkSnakeCase, _vtk.vtkAbstractMapper):
     """Base Mapper with methods common to other mappers.
@@ -933,10 +954,15 @@ class _BaseDataSetMapper(_BaseMapper):
         new_mapper = cast('_BaseDataSetMapper', super().copy())
         new_mapper._input_dataset = self._input_dataset
         if self._active_scalars_algo is not None:
+            active_algo = self._active_scalars_algo
             new_mapper.set_active_scalars(
-                self._active_scalars_algo.scalars_name,
-                self._active_scalars_algo.preference,
+                active_algo.scalars_name,
+                active_algo.preference,
             )
+            if active_algo.rgba_baker is not None:
+                new_algo = new_mapper._active_scalars_algo
+                if new_algo is not None:
+                    new_algo.rgba_baker = active_algo.rgba_baker
         new_mapper._set_scalar_range(self.scalar_range, use_default=self._use_default_scalar_range)
         return new_mapper
 
@@ -1011,6 +1037,52 @@ class _BaseDataSetMapper(_BaseMapper):
             if direct_scalars_color_mode:
                 # A direct color array holds colors, so keep the range of the data
                 self._set_scalar_range(scalar_range, use_default=False)
+
+    def _install_custom_opacity_baker(
+        self,
+        *,
+        source_name: str,
+        source_scalars: NDArray[Any],
+        opacity: NDArray[_Real],
+        cmap: ColormapOptions,
+        scalar_range: tuple[float, float],
+        n_colors: int,
+    ) -> None:
+        """Rebake per-point opacity colors in this mapper's pipeline.
+
+        The RGBA array used for direct coloring is otherwise a static snapshot.
+        Attaching a baker to the per-mapper :class:`ActiveScalarsAlgorithm`
+        recomputes it from the live source scalars whenever the pipeline updates,
+        so in-place edits and reassignment show on the next render. The baker and
+        its output live on the mapper's own algorithm, never on the shared dataset.
+        """
+        algo = self._active_scalars_algo
+        if algo is None:
+            return
+
+        association = self.scalar_map_mode
+        expected_size = np.asarray(source_scalars).shape[0]
+
+        def bake(dataset: DataSet) -> NDArray[np.uint8]:
+            source = None
+            attributes = dataset.cell_data if association == 'cell' else dataset.point_data
+            if source_name in attributes:
+                candidate = np.asarray(attributes[source_name])
+                if candidate.ndim == 1 and candidate.shape[0] == expected_size:
+                    source = candidate
+            if source is None:
+                # In-place edits are visible through the captured live view even
+                # when the source cannot be resolved back by name.
+                source = source_scalars
+            return _bake_custom_opacity_rgba(
+                source,
+                opacity=opacity,
+                cmap=cmap,
+                scalar_range=scalar_range,
+                n_colors=n_colors,
+            )
+
+        algo.rgba_baker = bake
 
     def set_scalars(
         self,
@@ -1234,6 +1306,8 @@ class _BaseDataSetMapper(_BaseMapper):
         if np.any(scalar_range) and not rgb:
             self._set_scalar_range(scalar_range, use_default=use_default_scalar_range)
 
+        custom_opacity_source: NDArray[Any] | None = None
+        custom_opacity_cmap: ColormapOptions | None = None
         if isinstance(cmap, pv.LookupTable):
             self.lookup_table = cmap
             self._set_scalar_range(self.lookup_table.scalar_range, use_default=False)
@@ -1262,16 +1336,15 @@ class _BaseDataSetMapper(_BaseMapper):
                 if opacity is None:
                     msg = 'Custom opacity requires an opacity array.'
                     raise ValueError(msg)
-                # need to round the colors here since we're
-                # directly displaying the colors
-                if scalar_range[0] != scalar_range[1]:
-                    hue = normalize(scalars, minimum=scalar_range[0], maximum=scalar_range[1])
-                else:
-                    hue = np.zeros(scalars.shape)
-                rounded = np.round(hue * n_colors) / n_colors
-                rgba: NDArray[np.floating] = get_cmap_safe(cmap)(rounded) * 255
-                rgba[:, -1] *= opacity
-                scalars = rgba.astype(np.uint8)
+                custom_opacity_source = scalars
+                custom_opacity_cmap = cmap
+                scalars = _bake_custom_opacity_rgba(
+                    scalars,
+                    opacity=opacity,
+                    cmap=cmap,
+                    scalar_range=scalar_range,
+                    n_colors=n_colors,
+                )
 
             # configure the lookup table
             if nan_color:
@@ -1298,6 +1371,16 @@ class _BaseDataSetMapper(_BaseMapper):
             direct_scalars_color_mode=rgb or custom_opac,
             overwrite=scalars_name != original_scalars_name,
         )
+
+        if custom_opac and custom_opacity_source is not None and custom_opacity_cmap is not None:
+            self._install_custom_opacity_baker(
+                source_name=original_scalars_name,
+                source_scalars=custom_opacity_source,
+                opacity=cast('NDArray[_Real]', opacity),
+                cmap=custom_opacity_cmap,
+                scalar_range=scalar_range,
+                n_colors=n_colors,
+            )
 
         if isinstance(self, PointGaussianMapper):
             self.as_rgba()

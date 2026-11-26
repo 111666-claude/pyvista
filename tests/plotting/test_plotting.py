@@ -3931,6 +3931,116 @@ def test_opacity_by_array_preference():
 
 
 @pytest.mark.usefixtures('no_images_to_verify')
+@pytest.mark.parametrize('update', ['inplace', 'reassign'])
+@pytest.mark.parametrize('opacity_mode', ['array', 'constant', 'none'])
+def test_scalar_color_updates_with_opacity(opacity_mode, update):
+    """Recoloring scalars reaches the next frame for every opacity mode."""
+    from matplotlib.colors import LinearSegmentedColormap
+
+    # Independently defined pure blue -> pure red table.
+    blue_red = LinearSegmentedColormap.from_list(
+        'independent_blue_red', [(0.0, 0.0, 1.0), (1.0, 0.0, 0.0)], N=256
+    )
+
+    mesh = pv.Plane(i_resolution=30, j_resolution=30)
+    mesh.point_data['color'] = np.zeros(mesh.n_points)
+    add_kwargs = {
+        'scalars': 'color',
+        'cmap': blue_red,
+        'clim': (0, 1),
+        'show_scalar_bar': False,
+    }
+    if opacity_mode == 'array':
+        mesh.point_data['opacity'] = np.ones(mesh.n_points)
+        add_kwargs['opacity'] = 'opacity'
+    elif opacity_mode == 'constant':
+        add_kwargs['opacity'] = 1.0
+
+    pl = pv.Plotter(window_size=(400, 400))
+    actor = pl.add_mesh(mesh, **add_kwargs)
+    pl.view_xy()
+    pl.camera.zoom(1.1)
+
+    def red_blue_pixels():
+        image = pl.screenshot(None)[:, :, :3].astype(int)
+        red = ((image[..., 0] > 150) & (image[..., 2] < 100)).sum()
+        blue = ((image[..., 2] > 150) & (image[..., 0] < 100)).sum()
+        return int(red), int(blue)
+
+    pl.render()
+    red_before, blue_before = red_blue_pixels()
+    assert blue_before > 10_000
+    assert red_before * 10 < blue_before
+
+    if update == 'inplace':
+        mesh.point_data['color'][:] = 1.0
+    else:
+        mesh.point_data['color'] = np.ones(mesh.n_points)
+
+    pl.render()
+    red_after, blue_after = red_blue_pixels()
+    assert red_after > 10_000
+    assert blue_after * 10 < red_after
+
+    # The fixed color range and a named per-point opacity array are retained.
+    assert actor.mapper.scalar_range == (0.0, 1.0)
+    if opacity_mode == 'array':
+        assert 'opacity' in mesh.point_data
+        assert np.allclose(mesh.point_data['opacity'], 1.0)
+    pl.close()
+
+
+@pytest.mark.usefixtures('no_images_to_verify')
+def test_custom_opacity_baker_is_per_actor():
+    """Two actors sharing a mesh bake independent colors and never cross-talk."""
+    from matplotlib.colors import LinearSegmentedColormap
+
+    blue_red = LinearSegmentedColormap.from_list(
+        'independent_blue_red', [(0.0, 0.0, 1.0), (1.0, 0.0, 0.0)], N=256
+    )
+    mesh = pv.Plane()
+    mesh.point_data['color'] = np.zeros(mesh.n_points)
+    opacity = np.ones(mesh.n_points)
+
+    pl = pv.Plotter()
+    low = pl.add_mesh(
+        mesh,
+        scalars='color',
+        opacity=opacity,
+        cmap=blue_red,
+        clim=(0, 1),
+        show_scalar_bar=False,
+        name='low_range_actor',
+    )
+    high = pl.add_mesh(
+        mesh,
+        scalars='color',
+        opacity=opacity,
+        cmap=blue_red,
+        clim=(0, 2),
+        show_scalar_bar=False,
+        name='high_range_actor',
+    )
+
+    mesh.point_data['color'][:] = 1.0
+
+    def baked_rgb(actor):
+        algo = actor.mapper._active_scalars_algo
+        algo.Update()
+        output = algo.GetOutputDataObject(0)
+        return np.asarray(output.GetPointData().GetArray('__custom_rgba'))[:, :3]
+
+    low_rgb = baked_rgb(low)
+    high_rgb = baked_rgb(high)
+    # clim=(0, 1) maps 1 to red while clim=(0, 2) maps it to the midpoint.
+    np.testing.assert_array_equal(low_rgb, np.tile([255, 0, 0], (mesh.n_points, 1)))
+    assert not np.allclose(high_rgb, low_rgb)
+    assert low.mapper.scalar_range == (0.0, 1.0)
+    assert high.mapper.scalar_range == (0.0, 2.0)
+    pl.close()
+
+
+@pytest.mark.usefixtures('no_images_to_verify')
 @pytest.mark.parametrize('mapping', [None, True, object()])
 def test_opacity_transfer_functions_raises(mapping):
     with pytest.raises(
