@@ -29,6 +29,7 @@ from pyvista import demos
 from pyvista import examples
 from pyvista.core.errors import DeprecationError
 from pyvista.core.errors import PyVistaDeprecationWarning
+from pyvista.core.errors import PyVistaPipelineError
 from pyvista.plotting import BackgroundPlotter
 from pyvista.plotting import QtDeprecationError
 from pyvista.plotting import QtInteractor
@@ -2770,6 +2771,191 @@ def test_array_volume_rendering(uniform, verify_image_cache):
     verify_image_cache.windows_skip_image_cache = True
     arr = uniform['Spatial Point Data'].reshape(uniform.dimensions)
     pv.plot(arr, volume=True, opacity='linear')
+
+
+@pytest.mark.skip_windows
+@pytest.mark.usefixtures('no_images_to_verify')
+def test_add_volume_algorithm_matches_static_output():
+    source = _vtk.vtkRTAnalyticSource()
+    source.SetWholeExtent(-2, 2, -2, 2, -2, 2)
+    source.Update()
+
+    static = pv.wrap(source.GetOutputDataObject(0)).cell_data_to_point_data()
+    expected = static.active_scalars
+
+    pl = pv.Plotter()
+    actor = pl.add_volume(source, cmap='coolwarm', opacity='linear')
+    actor.mapper.update()
+    output = actor.mapper.dataset
+
+    assert isinstance(output, pv.ImageData)
+    np.testing.assert_array_equal(output.active_scalars, expected)
+    np.testing.assert_allclose(actor.mapper.scalar_range, (expected.min(), expected.max()))
+    assert isinstance(actor.mapper.GetInputAlgorithm(), _vtk.vtkAlgorithm)
+    pl.close()
+
+
+@pytest.mark.skip_windows
+@pytest.mark.usefixtures('no_images_to_verify')
+def test_add_volume_algorithm_updates_through_same_actor():
+    source = _vtk.vtkRTAnalyticSource()
+    source.SetWholeExtent(-2, 2, -2, 2, -2, 2)
+
+    pl = pv.Plotter()
+    actor = pl.add_volume(source)
+    actor.mapper.update()
+    before = actor.mapper.dataset.active_scalars.copy()
+    n_actors = len(pl.renderer.actors)
+
+    source.SetXFreq(source.GetXFreq() + 5.0)
+    pl.render()
+    actor.mapper.update()
+    after = actor.mapper.dataset.active_scalars
+
+    assert not np.array_equal(before, after)
+    assert len(pl.renderer.actors) == n_actors
+    source.Update()
+    np.testing.assert_array_equal(after, pv.wrap(source.GetOutputDataObject(0)).active_scalars)
+    pl.close()
+
+
+@pytest.mark.skip_windows
+@pytest.mark.usefixtures('no_images_to_verify')
+def test_add_volume_algorithm_named_and_raw_scalars():
+    source = _vtk.vtkRTAnalyticSource()
+    source.SetWholeExtent(-2, 2, -2, 2, -2, 2)
+
+    # Named scalars existing on the output are selected by name, not stamped.
+    pl = pv.Plotter()
+    actor = pl.add_volume(source, scalars='RTData', cmap='jet')
+    actor.mapper.update()
+    assert actor.mapper.scalar_map_mode == 'point'
+    source.Update()
+    np.testing.assert_array_equal(
+        actor.mapper.dataset.active_scalars,
+        pv.wrap(source.GetOutputDataObject(0)).point_data['RTData'],
+    )
+    pl.close()
+
+    # Raw ndarray scalars are attached on each pipeline request and never
+    # mutate the source's own output.
+    source.Update()
+    raw = np.arange(source.GetOutputDataObject(0).GetNumberOfPoints(), dtype=float)
+    pl = pv.Plotter()
+    actor = pl.add_volume(source, scalars=raw)
+    actor.mapper.update()
+    np.testing.assert_array_equal(actor.mapper.dataset.active_scalars, raw)
+    source.Update()
+    assert 'Data' not in pv.wrap(source.GetOutputDataObject(0)).point_data
+
+    # Re-rendering re-stamps when the captured array is replaced in place.
+    raw[:] = raw * 2.0
+    pl.render()
+    actor.mapper.update()
+    np.testing.assert_array_equal(actor.mapper.dataset.active_scalars, raw)
+    pl.close()
+
+
+@pytest.mark.skip_windows
+@pytest.mark.usefixtures('no_images_to_verify')
+def test_add_volume_algorithm_cell_scalars_converted_to_point():
+    source = _vtk.vtkRTAnalyticSource()
+    source.SetWholeExtent(-1, 1, -1, 1, -1, 1)
+    point_to_cell = _vtk.vtkPointDataToCellData()
+    point_to_cell.SetInputConnection(source.GetOutputPort())
+    point_to_cell.Update()
+    assert 'RTData' in pv.wrap(point_to_cell.GetOutputDataObject(0)).cell_data
+
+    pl = pv.Plotter()
+    actor = pl.add_volume(point_to_cell, scalars='RTData')
+    actor.mapper.update()
+    output = actor.mapper.dataset
+    assert 'RTData' in output.point_data
+    assert actor.mapper.scalar_map_mode == 'point'
+    pl.close()
+
+
+@pytest.mark.skip_windows
+@pytest.mark.usefixtures('no_images_to_verify')
+def test_add_volume_algorithm_output_port():
+    source = _vtk.vtkRTAnalyticSource()
+    source.SetWholeExtent(-2, 2, -2, 2, -2, 2)
+
+    pl = pv.Plotter()
+    actor = pl.add_volume(source.GetOutputPort())
+    actor.mapper.update()
+    assert isinstance(actor.mapper.dataset, pv.ImageData)
+    pl.close()
+
+
+@pytest.mark.skip_windows
+@pytest.mark.usefixtures('no_images_to_verify')
+def test_add_volume_algorithm_rgba_scalars():
+    source = _vtk.vtkRTAnalyticSource()
+    source.SetWholeExtent(-2, 2, -2, 2, -2, 2)
+    source.Update()
+    n_points = source.GetOutputDataObject(0).GetNumberOfPoints()
+    rgba = np.zeros((n_points, 4), dtype=np.uint8)
+    rgba[:, 0] = np.linspace(0, 255, n_points, dtype=np.uint8)
+    rgba[:, 3] = 128
+
+    pl = pv.Plotter()
+    actor = pl.add_volume(source, scalars=rgba)
+    actor.mapper.update()
+    output = actor.mapper.dataset
+    assert output.point_data['Data'].dtype == np.uint8
+    assert output.point_data['Data'].shape == (n_points, 4)
+    assert actor.prop.independent_components is False
+
+    rgba[:, 1] = 200
+    pl.render()
+    actor.mapper.update()
+    assert actor.mapper.dataset.point_data['Data'][0, 1] == 200
+    pl.close()
+
+
+@pytest.mark.skip_windows
+@pytest.mark.usefixtures('no_images_to_verify')
+def test_add_volume_algorithm_cell_length_raw_scalars():
+    source = _vtk.vtkRTAnalyticSource()
+    source.SetWholeExtent(-2, 2, -2, 2, -2, 2)
+    source.Update()
+    n_cells = source.GetOutputDataObject(0).GetNumberOfCells()
+    cell_scalars = np.arange(n_cells, dtype=float)
+
+    pl = pv.Plotter()
+    actor = pl.add_volume(source, scalars=cell_scalars)
+    actor.mapper.update()
+    assert actor.mapper.scalar_map_mode == 'cell'
+    output = actor.mapper.dataset
+    assert 'Data' in output.cell_data
+    np.testing.assert_array_equal(output.cell_data['Data'], cell_scalars)
+    pl.close()
+
+
+@pytest.mark.skip_windows
+@pytest.mark.usefixtures('no_images_to_verify')
+def test_add_volume_algorithm_invalid_outputs():
+    empty_source = pv.source_algorithm(pv.ImageData, output_type=pv.ImageData)
+    multiblock_source = pv.source_algorithm(
+        lambda: pv.MultiBlock([pv.ImageData(dimensions=(2, 2, 2))]),
+        output_type='vtkMultiBlockDataSet',
+    )
+
+    pl = pv.Plotter()
+    with pytest.raises(PyVistaPipelineError, match='empty output'):
+        pl.add_volume(empty_source)
+    pl.close()
+
+    pl = pv.Plotter()
+    with pytest.raises(TypeError, match='not supported for volume rendering'):
+        pl.add_volume(_vtk.vtkConeSource())
+    pl.close()
+
+    pl = pv.Plotter()
+    with pytest.raises(TypeError, match='MultiBlock'):
+        pl.add_volume(multiblock_source)
+    pl.close()
 
 
 @pytest.mark.parametrize(

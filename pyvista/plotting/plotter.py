@@ -40,6 +40,7 @@ from pyvista._warn_external import warn_external
 from pyvista.core.errors import DeprecationError
 from pyvista.core.errors import MissingDataError
 from pyvista.core.errors import PyVistaDeprecationWarning
+from pyvista.core.errors import PyVistaPipelineError
 from pyvista.core.filters import _update_alg
 from pyvista.core.utilities.arrays import FieldAssociation
 from pyvista.core.utilities.arrays import _coerce_pointslike_arg
@@ -108,6 +109,7 @@ from .tools import _prepare_offscreen_macos_render_window
 from .utilities.algorithms import active_scalars_algorithm
 from .utilities.algorithms import algorithm_to_mesh_handler
 from .utilities.algorithms import callback_algorithm
+from .utilities.algorithms import cell_data_to_point_data_algorithm
 from .utilities.algorithms import decimation_algorithm
 from .utilities.algorithms import extract_surface_algorithm
 from .utilities.algorithms import pointset_to_polydata_algorithm
@@ -320,6 +322,48 @@ def _attach_raw_scalars_via_callback(  # noqa: PLR0917
     # so this branch is unreachable.
     assert resolved_algo is not None  # noqa: S101
     return resolved_algo, resolved_mesh
+
+
+def _attach_volume_scalars(
+    *,
+    scalars: NDArray[Any],
+    scalars_name: str,
+    preference: PointLiteral | CellLiteral,
+) -> Callable[[DataSet], DataSet]:
+    """Build a callback that stamps volume scalars onto a pipeline output.
+
+    Used by :meth:`Plotter.add_volume` when an upstream :vtk:`vtkAlgorithm`
+    input is combined with scalars that do not exist on the pipeline output
+    by name. Each pipeline request receives a shallow copy carrying the array
+    so the source dataset itself is never modified.
+
+    Parameters
+    ----------
+    scalars : numpy.ndarray
+        Array to attach.
+
+    scalars_name : str
+        Name under which to attach the array.
+
+    preference : str
+        Either ``'point'`` or ``'cell'``.
+
+    Returns
+    -------
+    callable
+        Callback suitable for :func:`callback_algorithm`.
+
+    """
+
+    def _attach(dataset: DataSet) -> DataSet:
+        output = dataset.copy(deep=False)
+        if preference == 'point':
+            output.point_data.set_array(scalars, scalars_name, deep_copy=False)
+        else:
+            output.cell_data.set_array(scalars, scalars_name, deep_copy=False)
+        return output
+
+    return _attach
 
 
 def _warn_xserver() -> None:  # pragma: no cover
@@ -4983,16 +5027,22 @@ class BasePlotter(_BoundsSizeMixin):
     # fmt: off
     # ruff: disable[E501]
     @overload
-    def add_volume(self, volume: MultiBlock[Any], *, scalars: str | NDArray[np.floating] | None = ..., clim: float | tuple[float, float] | None = ..., resolution: VectorLikeFloat | None = ..., opacity: float | OpacityOptions | VectorLikeFloat = ..., n_colors: int = ..., cmap: ColormapOptions | LookupTable | None = ..., flip_scalars: bool = ..., reset_camera: bool | None = ..., name: str | None = ..., ambient: float | None = ..., categories: bool | int = ..., culling: CullingOptions | bool = ..., multi_colors: bool = ..., blending: Literal['additive', 'maximum', 'minimum', 'composite', 'average'] = ..., mapper: Literal['fixed_point', 'gpu', 'open_gl', 'smart', 'ugrid'] | None = ..., scalar_bar_args: ScalarBarArgs | None = ..., show_scalar_bar: bool | None = ..., annotations: dict[float, str] | None = ..., pickable: bool = ..., preference: PointLiteral | CellLiteral = ..., opacity_unit_distance: float | None = ..., shade: bool = ..., diffuse: float = ..., specular: float = ..., specular_power: float = ..., render: bool | None = ..., user_matrix: TransformLike | None = ..., log_scale: bool = ..., **kwargs) -> list[Volume]: ...
+    def add_volume(self, volume: MultiBlock[Any] | _vtk.vtkAlgorithm | _vtk.vtkAlgorithmOutput, *, scalars: str | NDArray[np.floating] | None = ..., clim: float | tuple[float, float] | None = ..., resolution: VectorLikeFloat | None = ..., opacity: float | OpacityOptions | VectorLikeFloat = ..., n_colors: int = ..., cmap: ColormapOptions | LookupTable | None = ..., flip_scalars: bool = ..., reset_camera: bool | None = ..., name: str | None = ..., ambient: float | None = ..., categories: bool | int = ..., culling: CullingOptions | bool = ..., multi_colors: bool = ..., blending: Literal['additive', 'maximum', 'minimum', 'composite', 'average'] = ..., mapper: Literal['fixed_point', 'gpu', 'open_gl', 'smart', 'ugrid'] | None = ..., scalar_bar_args: ScalarBarArgs | None = ..., show_scalar_bar: bool | None = ..., annotations: dict[float, str] | None = ..., pickable: bool = ..., preference: PointLiteral | CellLiteral = ..., opacity_unit_distance: float | None = ..., shade: bool = ..., diffuse: float = ..., specular: float = ..., specular_power: float = ..., render: bool | None = ..., user_matrix: TransformLike | None = ..., log_scale: bool = ..., **kwargs) -> list[Volume]: ...
     @overload
-    def add_volume(self, volume: DataSet | NDArray[_Real], *, scalars: str | NDArray[np.floating] | None = ..., clim: float | tuple[float, float] | None = ..., resolution: VectorLikeFloat | None = ..., opacity: float | OpacityOptions | VectorLikeFloat = ..., n_colors: int = ..., cmap: ColormapOptions | LookupTable | None = ..., flip_scalars: bool = ..., reset_camera: bool | None = ..., name: str | None = ..., ambient: float | None = ..., categories: bool | int = ..., culling: CullingOptions | bool = ..., multi_colors: bool = ..., blending: Literal['additive', 'maximum', 'minimum', 'composite', 'average'] = ..., mapper: Literal['fixed_point', 'gpu', 'open_gl', 'smart', 'ugrid'] | None = ..., scalar_bar_args: ScalarBarArgs | None = ..., show_scalar_bar: bool | None = ..., annotations: dict[float, str] | None = ..., pickable: bool = ..., preference: PointLiteral | CellLiteral = ..., opacity_unit_distance: float | None = ..., shade: bool = ..., diffuse: float = ..., specular: float = ..., specular_power: float = ..., render: bool | None = ..., user_matrix: TransformLike | None = ..., log_scale: bool = ..., **kwargs) -> Volume: ...
+    def add_volume(self, volume: DataSet | NDArray[_Real] | _vtk.vtkAlgorithm | _vtk.vtkAlgorithmOutput, *, scalars: str | NDArray[np.floating] | None = ..., clim: float | tuple[float, float] | None = ..., resolution: VectorLikeFloat | None = ..., opacity: float | OpacityOptions | VectorLikeFloat = ..., n_colors: int = ..., cmap: ColormapOptions | LookupTable | None = ..., flip_scalars: bool = ..., reset_camera: bool | None = ..., name: str | None = ..., ambient: float | None = ..., categories: bool | int = ..., culling: CullingOptions | bool = ..., multi_colors: bool = ..., blending: Literal['additive', 'maximum', 'minimum', 'composite', 'average'] = ..., mapper: Literal['fixed_point', 'gpu', 'open_gl', 'smart', 'ugrid'] | None = ..., scalar_bar_args: ScalarBarArgs | None = ..., show_scalar_bar: bool | None = ..., annotations: dict[float, str] | None = ..., pickable: bool = ..., preference: PointLiteral | CellLiteral = ..., opacity_unit_distance: float | None = ..., shade: bool = ..., diffuse: float = ..., specular: float = ..., specular_power: float = ..., render: bool | None = ..., user_matrix: TransformLike | None = ..., log_scale: bool = ..., **kwargs) -> Volume: ...
     @overload
-    def add_volume(self, volume: DataSet | MultiBlock[Any] | NDArray[_Real], *, scalars: str | NDArray[np.floating] | None = ..., clim: float | tuple[float, float] | None = ..., resolution: VectorLikeFloat | None = ..., opacity: float | OpacityOptions | VectorLikeFloat = ..., n_colors: int = ..., cmap: ColormapOptions | LookupTable | None = ..., flip_scalars: bool = ..., reset_camera: bool | None = ..., name: str | None = ..., ambient: float | None = ..., categories: bool | int = ..., culling: CullingOptions | bool = ..., multi_colors: bool = ..., blending: Literal['additive', 'maximum', 'minimum', 'composite', 'average'] = ..., mapper: Literal['fixed_point', 'gpu', 'open_gl', 'smart', 'ugrid'] | None = ..., scalar_bar_args: ScalarBarArgs | None = ..., show_scalar_bar: bool | None = ..., annotations: dict[float, str] | None = ..., pickable: bool = ..., preference: PointLiteral | CellLiteral = ..., opacity_unit_distance: float | None = ..., shade: bool = ..., diffuse: float = ..., specular: float = ..., specular_power: float = ..., render: bool | None = ..., user_matrix: TransformLike | None = ..., log_scale: bool = ..., **kwargs) -> Volume | list[Volume]: ...
+    def add_volume(self, volume: DataSet | MultiBlock[Any] | NDArray[_Real] | _vtk.vtkAlgorithm | _vtk.vtkAlgorithmOutput, *, scalars: str | NDArray[np.floating] | None = ..., clim: float | tuple[float, float] | None = ..., resolution: VectorLikeFloat | None = ..., opacity: float | OpacityOptions | VectorLikeFloat = ..., n_colors: int = ..., cmap: ColormapOptions | LookupTable | None = ..., flip_scalars: bool = ..., reset_camera: bool | None = ..., name: str | None = ..., ambient: float | None = ..., categories: bool | int = ..., culling: CullingOptions | bool = ..., multi_colors: bool = ..., blending: Literal['additive', 'maximum', 'minimum', 'composite', 'average'] = ..., mapper: Literal['fixed_point', 'gpu', 'open_gl', 'smart', 'ugrid'] | None = ..., scalar_bar_args: ScalarBarArgs | None = ..., show_scalar_bar: bool | None = ..., annotations: dict[float, str] | None = ..., pickable: bool = ..., preference: PointLiteral | CellLiteral = ..., opacity_unit_distance: float | None = ..., shade: bool = ..., diffuse: float = ..., specular: float = ..., specular_power: float = ..., render: bool | None = ..., user_matrix: TransformLike | None = ..., log_scale: bool = ..., **kwargs) -> Volume | list[Volume]: ...
     # ruff: enable[E501]
     # fmt: on
     def add_volume(
         self,
-        volume: DataSet | MultiBlock[Any] | NDArray[_Real],
+        volume: (
+            DataSet
+            | MultiBlock[Any]
+            | NDArray[_Real]
+            | _vtk.vtkAlgorithm
+            | _vtk.vtkAlgorithmOutput
+        ),
         *,
         scalars: str | NDArray[np.floating] | None = None,
         clim: float | tuple[float, float] | None = None,
@@ -5030,10 +5080,24 @@ class BasePlotter(_BoundsSizeMixin):
         :class:`pyvista.ImageData`, :class:`pyvista.RectilinearGrid`,
         or :class:`pyvista.UnstructuredGrid`.
 
+        A :vtk:`vtkAlgorithm` (or :vtk:`vtkAlgorithmOutput`) that produces
+        one of these datasets is also accepted. The mapper is connected to
+        the algorithm's output port, so the same volume actor reflects
+        updates made to the source.
+
         Parameters
         ----------
-        volume : 3D numpy.ndarray | DataSet | MultiBlock
+        volume : 3D numpy.ndarray | DataSet | MultiBlock | :vtk:`vtkAlgorithm`
             The input volume to visualize. 3D NumPy arrays are accepted.
+            An algorithm must produce a :class:`pyvista.ImageData`,
+            :class:`pyvista.RectilinearGrid`, or
+            :class:`pyvista.UnstructuredGrid` output.
+
+            .. versionadded:: 0.50
+
+                Support for a :vtk:`vtkAlgorithm` or
+                :vtk:`vtkAlgorithmOutput` input whose volume actor stays
+                connected to the algorithm's pipeline.
 
             .. warning::
                 If the input is not :class:`numpy.ndarray`,
@@ -5349,6 +5413,11 @@ class BasePlotter(_BoundsSizeMixin):
         if render is None:
             render = not self._first_time
 
+        # Resolve a vtkAlgorithm input into its output dataset while keeping
+        # the algorithm so the mapper can stay connected to the pipeline.
+        volume, algo = algorithm_to_mesh_handler(volume)
+        volume = cast('pv.DataSet | pv.MultiBlock | NDArray[_Real]', volume)
+
         # Convert the VTK data object to a pyvista wrapped object if necessary
         if not is_pyvista_dataset(volume):
             if isinstance(volume, np.ndarray):
@@ -5360,12 +5429,38 @@ class BasePlotter(_BoundsSizeMixin):
                     raise ValueError(msg)
                 volume.spacing = resolution
             _validation.check_instance(volume, (pv.DataSet, pv.MultiBlock), name='volume')
-        else:
+        elif algo is None:
             # HACK: Make a copy so the original object is not altered.
             #       Also, place all data on the nodes as issues arise when
             #       volume rendering on the cells.
             volume = volume.cell_data_to_point_data()
         assert isinstance(volume, (pv.DataSet, pv.MultiBlock))  # noqa: S101
+
+        if algo is not None:
+            if isinstance(volume, pv.MultiBlock):
+                msg = (
+                    'Algorithms with `MultiBlock` output type are not supported by '
+                    '`add_volume` at this time.'
+                )
+                raise TypeError(msg)
+            if not isinstance(
+                volume,
+                (pv.ImageData, pv.RectilinearGrid, pv.UnstructuredGrid),
+            ):
+                msg = (
+                    f'Type {type(volume)} produced by the algorithm is not supported for '
+                    'volume rendering. The algorithm must produce an `ImageData`, '
+                    '`RectilinearGrid`, or `UnstructuredGrid` output.'
+                )
+                raise TypeError(msg)
+            if volume.n_points == 0:
+                msg = (
+                    'The passed algorithm produced an empty output and cannot be volume rendered.'
+                )
+                raise PyVistaPipelineError(msg)
+            # Keep the point-based data the concrete-input path creates above.
+            algo = cell_data_to_point_data_algorithm(algo)
+            volume, algo = algorithm_to_mesh_handler(algo)
 
         if name is None:
             name = f'{type(volume).__name__}({volume.memory_address})'
@@ -5434,9 +5529,12 @@ class BasePlotter(_BoundsSizeMixin):
 
         # Override mapper choice for UnstructuredGrid
         if isinstance(volume, pv.UnstructuredGrid):
-            # Unstructured grid must be all tetrahedrals
-            if not (volume.celltypes == pv.CellType.TETRA).all():
-                volume = volume.triangulate()
+            if algo is None:
+                # Unstructured grid must be all tetrahedrals. Algorithm inputs
+                # cannot be triangulated without breaking the pipeline, and the
+                # ugrid mapper handles arbitrary cell types directly.
+                if not (volume.celltypes == pv.CellType.TETRA).all():
+                    volume = volume.triangulate()
             mapper = 'ugrid'
 
         if mapper == 'fixed_point' and not isinstance(volume, pv.ImageData):
@@ -5473,6 +5571,14 @@ class BasePlotter(_BoundsSizeMixin):
             scalar_bar_args.setdefault('title', title)
         elif not isinstance(scalars, np.ndarray):
             scalars = np.asarray(scalars)  # type: ignore[unreachable]
+        elif (
+            algo is not None
+            and (active_name := volume.active_scalars_name) is not None
+            and np.shares_memory(scalars, volume.active_scalars)
+        ):
+            # The array already lives on the pipeline output; select it by
+            # name on each request instead of stamping a frozen snapshot back.
+            title = active_name
         scalars = cast('NDArray[np.floating]', scalars)
 
         if not np.issubdtype(scalars.dtype, np.number):
@@ -5529,16 +5635,37 @@ class BasePlotter(_BoundsSizeMixin):
         if log_scale and clim[0] <= 0:
             clim = (sys.float_info.min, clim[1])
 
-        volume[title] = scalars
-        volume.active_scalars_name = title
-
         # Scalars interpolation approach
+        scalar_map_mode: PointLiteral | CellLiteral
         if scalars.shape[0] == volume.n_points:
-            self.mapper.scalar_map_mode = 'point'
+            scalar_map_mode = 'point'
         elif scalars.shape[0] == volume.n_cells:
-            self.mapper.scalar_map_mode = 'cell'
+            scalar_map_mode = 'cell'
         else:
             raise_not_matching(scalars, volume)
+
+        if algo is not None:
+            # Keep the mapper connected to the pipeline. Raw arrays are
+            # attached on each pipeline request by a callback and the active
+            # scalars are selected by a downstream stage instead of mutating
+            # the snapshot taken from the algorithm's output.
+            field_data = volume.point_data if scalar_map_mode == 'point' else volume.cell_data
+            if title not in field_data:
+                algo = callback_algorithm(
+                    algo,
+                    _attach_volume_scalars(
+                        scalars=scalars,
+                        scalars_name=title,
+                        preference=scalar_map_mode,
+                    ),
+                )
+            algo = active_scalars_algorithm(algo, title, preference=scalar_map_mode)
+            volume, algo = algorithm_to_mesh_handler(algo)
+        else:
+            volume[title] = scalars
+            volume.active_scalars_name = title
+
+        self.mapper.scalar_map_mode = scalar_map_mode
 
         self.mapper.scalar_range = clim
 
@@ -5568,7 +5695,7 @@ class BasePlotter(_BoundsSizeMixin):
             elif isinstance(annotations, dict):
                 self.mapper.lookup_table.annotations = annotations
 
-        self.mapper.dataset = volume
+        set_algorithm_input(self.mapper, algo or volume)
         self.mapper.blend_mode = blending
         self.mapper.update()
 
